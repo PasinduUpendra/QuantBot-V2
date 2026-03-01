@@ -66,13 +66,13 @@ class HydraEngine:
     7. Sleep and repeat
     """
     
-    # Strategy execution intervals (seconds)
+    # Strategy execution intervals (seconds) — AGGRESSIVE mode
     INTERVALS = {
-        'GRID': 30,        # Grid needs frequent checking
-        'MEAN_REV': 60,    # Mean reversion on 5m candles
-        'MOMENTUM': 300,   # Momentum on 1h candles
-        'FUND_ARB': 900,   # Funding rate changes slowly
-        'REGIME': 1800,    # Regime check every 30 min
+        'GRID': 20,        # Grid needs frequent checking (was 30)
+        'MEAN_REV': 30,    # Mean reversion on 5m candles (was 60)
+        'MOMENTUM': 120,   # Momentum on 15m candles (was 300)
+        'FUND_ARB': 3600,  # Funding rate — disabled, just health-check hourly
+        'REGIME': 1200,    # Regime check every 20 min (was 30)
         'STATS': 120,      # Stats every 2 min
         'SAVE': 300,       # Save state every 5 min
     }
@@ -99,18 +99,26 @@ class HydraEngine:
         # Initialize AI regime detector
         self.regime_detector = MarketRegimeDetector()
         
-        # Initialize strategies
+        # Initialize strategies (FUND_ARB disabled — no futures perms)
         self.strategies = {
             'GRID': GridTradingStrategy(self.exchange, self.risk),
             'MEAN_REV': MeanReversionStrategy(self.exchange, self.risk),
             'MOMENTUM': MomentumBreakoutStrategy(self.exchange, self.risk),
             'FUND_ARB': FundingArbStrategy(self.exchange, self.risk),
         }
+        # Deactivate FundArb since we have no futures trading permissions
+        self.strategies['FUND_ARB'].active = False
+        logger.warning("[ENGINE] FUND_ARB DISABLED — no futures trading permissions")
         
         # Timing
         self.last_run: Dict[str, float] = {k: 0 for k in self.INTERVALS}
         self.start_time = time.time()
         self.cycle_count = 0
+        
+        # FIX-3: Startup cooldown — block new entries for 5 min after boot
+        # Prevents burst of 6 correlated MOM entries on restart (16:07 incident)
+        self.startup_cooldown_sec = 300  # 5 minutes
+        self.startup_ready = False
         
         # Graceful shutdown
         self.running = True
@@ -182,6 +190,26 @@ class HydraEngine:
                     self._run_regime_detection()
                     self.last_run['REGIME'] = now
                 
+                # ===== FIX-3: STARTUP COOLDOWN =====
+                # Block new entries for 5 min after boot to let indicators stabilize
+                if not self.startup_ready:
+                    elapsed = now - self.start_time
+                    if elapsed < self.startup_cooldown_sec:
+                        remaining = self.startup_cooldown_sec - elapsed
+                        if self.cycle_count % 30 == 1:  # Log every ~90s
+                            logger.info(f"[ENGINE] Startup cooldown: {remaining:.0f}s remaining — no new entries")
+                        # Still manage existing positions (Grid rebalance, trailing stops)
+                        if PAPER_TRADE:
+                            self.exchange.check_paper_orders()
+                        if now - self.last_run.get('STATS', 0) > self.INTERVALS['STATS']:
+                            self._log_performance()
+                            self.last_run['STATS'] = now
+                        time.sleep(3)
+                        continue
+                    else:
+                        self.startup_ready = True
+                        logger.info("[ENGINE] Startup cooldown complete — strategies armed")
+                
                 # ===== 2. EXECUTE STRATEGIES =====
                 
                 # Grid Trading (most frequent)
@@ -218,9 +246,9 @@ class HydraEngine:
                     self._save_state()
                     self.last_run['SAVE'] = now
                 
-                # Sleep between cycles
+                # Sleep between cycles (faster for aggressive mode)
                 cycle_time = time.time() - cycle_start
-                sleep_time = max(1, 5 - cycle_time)  # Target 5-second cycles
+                sleep_time = max(0.5, 3 - cycle_time)  # Target 3-second cycles (was 5)
                 time.sleep(sleep_time)
                 
             except KeyboardInterrupt:
@@ -268,6 +296,7 @@ class HydraEngine:
                     if strat_name in self.strategies:
                         old_alloc = self.strategies[strat_name].allocation
                         self.strategies[strat_name].allocation = weight
+                        self.strategies[strat_name].current_regime = regime
                         if abs(old_alloc - weight) > 0.05:
                             logger.info(f"[REGIME] {strat_name} allocation: "
                                       f"{old_alloc*100:.0f}% → {weight*100:.0f}%")

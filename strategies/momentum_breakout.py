@@ -45,7 +45,10 @@ class MomentumBreakoutStrategy(BaseStrategy):
         self.pairs = MOMENTUM_PAIRS
         self.open_positions: Dict[str, Dict] = {}
         self.cooldowns: Dict[str, float] = {}
-        self.cooldown_period = 1800  # 30 min cooldown
+        self.cooldown_period = 600  # 10 min cooldown (was 30 min)
+        # FIX-4: Global entry spacing — prevent correlated burst entries on restart
+        self.last_global_entry_time = 0
+        self.global_entry_spacing = 600  # 10 min between ANY MOM entry
     
     def analyze(self) -> List[Dict]:
         """Analyze pairs for momentum breakout opportunities."""
@@ -116,6 +119,21 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 
                 signal = None
                 
+                # FIX-2: HARD VOLUME GATE — no volume = no trade, period
+                # 48% of MOM signals had vol < 1.0x and most lost money
+                if vol_ratio < 1.0:
+                    continue  # Below-average volume = no conviction
+
+                # DIRECTIONAL FILTER: Hard block — never BUY when bears dominate
+                if current_minus_di > current_plus_di:
+                    continue  # -DI > +DI means sellers in control
+                
+                # REGIME FILTER: In bear markets, require very strong momentum
+                if self.current_regime in ('TRENDING_BEAR', 'RISK_OFF'):
+                    # Only enter if ADX very strong AND bullish DI dominant
+                    if current_adx < 30 or current_plus_di < current_minus_di * 1.5:
+                        continue
+                
                 # BULLISH MOMENTUM
                 bullish_conditions = [
                     current_ema_fast > current_ema_slow,           # Fast above slow
@@ -123,8 +141,8 @@ class MomentumBreakoutStrategy(BaseStrategy):
                     current_price > recent_high * 0.995,           # Near breakout
                     current_price > current_ema_trend,             # Above trend EMA
                     current_adx > MOM_ADX_THRESHOLD,               # Strong trend
-                    current_plus_di > current_minus_di,            # Bullish DI
-                    vol_ratio > MOM_VOLUME_MULT * 0.8,             # Volume confirmation
+                    current_plus_di > current_minus_di * 1.2,      # Clear bullish DI gap
+                    vol_ratio > MOM_VOLUME_MULT,                   # Full volume confirmation
                     current_macd_hist > 0,                         # MACD bullish
                 ]
                 
@@ -145,7 +163,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 bearish_score = sum(bearish_conditions) / len(bearish_conditions)
                 
                 # Generate signal if strong enough
-                if bullish_score >= 0.7:
+                if bullish_score >= 0.70:  # Raised back — quality over quantity
                     # Fresh crossover gets bonus
                     is_fresh = prev_ema_fast <= prev_ema_slow and current_ema_fast > current_ema_slow
                     strength = bullish_score * 2 + (0.5 if is_fresh else 0)
@@ -169,7 +187,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
                         'macd_hist': current_macd_hist,
                     }
                 
-                if signal and signal['strength'] >= 1.3:
+                if signal and signal['strength'] >= 1.3:  # Raised back — high confidence only
                     signals.append(signal)
                     logger.info(f"[MOM] Signal: {signal['side']} {symbol} | "
                               f"Strength: {signal['strength']:.2f} | "
@@ -194,7 +212,10 @@ class MomentumBreakoutStrategy(BaseStrategy):
         
         signals = self.analyze()
         signals.sort(key=lambda s: s['strength'], reverse=True)
-        
+
+        # FIX-4: Global entry spacing — max 1 new MOM entry per cycle, 10min apart
+        entries_this_cycle = 0
+
         for signal in signals:
             symbol = signal['symbol']
             
@@ -202,6 +223,13 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 continue
             
             if len(self.open_positions) >= MOM_MAX_POSITIONS:
+                break
+
+            # FIX-4: Only 1 entry per execute cycle, and min 10min since last
+            if entries_this_cycle >= 1:
+                break
+            if time.time() - self.last_global_entry_time < self.global_entry_spacing:
+                logger.debug(f"[MOM] Skipping {symbol}: global entry cooldown ({self.global_entry_spacing}s)")
                 break
             
             if signal['side'] != 'BUY':
@@ -247,6 +275,8 @@ class MomentumBreakoutStrategy(BaseStrategy):
                     )
                     
                     self.cooldowns[symbol] = time.time()
+                    self.last_global_entry_time = time.time()  # FIX-4: Update global timer
+                    entries_this_cycle += 1  # FIX-4: Count entries this cycle
                     
                     logger.info(f"[MOM] ENTERED: BUY {position_size:.6f} {symbol} @ {signal['entry']:.2f}")
                     

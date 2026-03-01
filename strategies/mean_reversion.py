@@ -29,7 +29,7 @@ from core import (
     MR_TIMEFRAME, MR_BB_PERIOD, MR_BB_STD, MR_RSI_PERIOD,
     MR_RSI_OVERSOLD, MR_RSI_OVERBOUGHT, MR_ATR_PERIOD,
     MR_ATR_STOP_MULT, MR_ATR_TARGET_MULT, MR_MAX_POSITIONS,
-    MR_LOOKBACK_CANDLES
+    MR_LOOKBACK_CANDLES, MR_MIN_STOP_DISTANCE_PCT
 )
 
 
@@ -44,7 +44,7 @@ class MeanReversionStrategy(BaseStrategy):
         self.pairs = MEAN_REVERSION_PAIRS
         self.open_positions: Dict[str, Dict] = {}
         self.cooldowns: Dict[str, float] = {}  # symbol -> last_trade_time
-        self.cooldown_period = 300  # 5 min cooldown between trades per pair
+        self.cooldown_period = 600  # 10 min cooldown — stop overtrading
     
     def analyze(self) -> List[Dict]:
         """Analyze pairs for mean reversion opportunities."""
@@ -101,10 +101,24 @@ class MeanReversionStrategy(BaseStrategy):
                 
                 signal = None
                 
+                # TREND FILTER: Check SMA slope — don't buy dips in downtrends!
+                sma50 = close.rolling(50).mean()
+                if len(sma50.dropna()) >= 5:
+                    sma_slope = (float(sma50.iloc[-1]) - float(sma50.iloc[-5])) / float(sma50.iloc[-5]) * 100
+                else:
+                    sma_slope = 0
+                
+                # REGIME GATE: Skip LONG entries in strong downtrends
+                if self.current_regime in ('TRENDING_BEAR', 'RISK_OFF'):
+                    # In bear markets, only allow MR if the pair itself is ranging
+                    if sma_slope < -0.1:  # FIX-5: Tightened from -0.3 — any SMA decline = no entry
+                        continue
+                
                 # LONG SIGNAL: Price near/below lower band + RSI oversold + volume spike
-                if (current_pct_b < 0.1 and 
+                if (current_pct_b < 0.10 and 
                     current_rsi < MR_RSI_OVERSOLD and
-                    vol_ratio > 1.2):
+                    vol_ratio > 1.0 and
+                    sma_slope > -0.1):  # FIX-5: Tightened from -0.5 — SMA must be flat or rising
                     
                     # Confluence score
                     strength = 0
@@ -117,7 +131,14 @@ class MeanReversionStrategy(BaseStrategy):
                         strength += 0.5
                     
                     stop_loss = current_price - (current_atr * MR_ATR_STOP_MULT)
+                    # Enforce minimum stop distance to avoid precision bugs
+                    min_stop_dist = current_price * MR_MIN_STOP_DISTANCE_PCT / 100
+                    if abs(current_price - stop_loss) < min_stop_dist:
+                        stop_loss = current_price - min_stop_dist
                     take_profit = current_sma  # Target middle band
+                    # Ensure target is at least min_stop_dist away
+                    if abs(take_profit - current_price) < min_stop_dist:
+                        take_profit = current_price + (min_stop_dist * 2)
                     
                     signal = {
                         'symbol': symbol,
@@ -134,9 +155,9 @@ class MeanReversionStrategy(BaseStrategy):
                     }
                 
                 # SHORT SIGNAL: Price near/above upper band + RSI overbought + volume spike
-                elif (current_pct_b > 0.9 and 
+                elif (current_pct_b > 0.85 and 
                       current_rsi > MR_RSI_OVERBOUGHT and
-                      vol_ratio > 1.2):
+                      vol_ratio > 1.0):
                     
                     strength = 0
                     strength += min(1.0, (current_rsi - MR_RSI_OVERBOUGHT) / 20)
@@ -146,11 +167,14 @@ class MeanReversionStrategy(BaseStrategy):
                     if self._is_bearish_reversal(df):
                         strength += 0.5
                     
-                    # For spot, we can only short by selling existing position
-                    # But we can still use this as an exit signal for longs
-                    # Or trade on futures
                     stop_loss = current_price + (current_atr * MR_ATR_STOP_MULT)
+                    # Enforce minimum stop distance
+                    min_stop_dist = current_price * MR_MIN_STOP_DISTANCE_PCT / 100
+                    if abs(stop_loss - current_price) < min_stop_dist:
+                        stop_loss = current_price + min_stop_dist
                     take_profit = current_sma
+                    if abs(current_price - take_profit) < min_stop_dist:
+                        take_profit = current_price - (min_stop_dist * 2)
                     
                     signal = {
                         'symbol': symbol,
@@ -166,7 +190,7 @@ class MeanReversionStrategy(BaseStrategy):
                         'bb_width': current_bb_width,
                     }
                 
-                if signal and signal['strength'] >= 1.5:  # Minimum strength threshold
+                if signal and signal['strength'] >= 1.5:  # Raised back — only high-confidence signals
                     signals.append(signal)
                     logger.info(f"[MR] Signal: {signal['side']} {symbol} | "
                               f"Strength: {signal['strength']:.2f} | "
@@ -286,10 +310,10 @@ class MeanReversionStrategy(BaseStrategy):
                     should_exit = True
                     exit_reason = "Take profit hit"
                 
-                # Time-based exit: close after 2 hours if minimal movement
-                elif time.time() - pos['entry_time'] > 7200:  # 2 hours
+                # Time-based exit: close after 1 hour if minimal movement
+                elif time.time() - pos['entry_time'] > 3600:  # 1 hour (was 2h)
                     pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
-                    if abs(pnl_pct) < 0.1:
+                    if abs(pnl_pct) < 0.05:
                         should_exit = True
                         exit_reason = "Time exit (stale)"
                 
