@@ -15,7 +15,7 @@ from loguru import logger
 
 from core import (
     MAX_DRAWDOWN_PCT, DAILY_LOSS_LIMIT_PCT, MAX_POSITION_PCT,
-    MAX_TOTAL_EXPOSURE_PCT, RISK_PER_TRADE_PCT, DATA_DIR
+    MAX_TOTAL_EXPOSURE_PCT, RISK_PER_TRADE_PCT, MIN_TRADE_VALUE, DATA_DIR
 )
 
 
@@ -125,15 +125,14 @@ class RiskManager:
         risk_amount = trade_value * (RISK_PER_TRADE_PCT / 100)
         max_risk = self.current_equity * (RISK_PER_TRADE_PCT / 100)
         
-        # Rule 6: Consecutive loss throttle
-        if self.consecutive_losses >= 5:
-            # Reduce position sizes by 50% after 5 consecutive losses
+        # Rule 6: Consecutive loss throttle (only after 7 losses, less aggressive)
+        if self.consecutive_losses >= 7:
             if trade_value > (self.current_equity * MAX_POSITION_PCT / 200):
                 return False, f"Consecutive losses ({self.consecutive_losses}): reduce size"
         
-        # Rule 7: Minimum trade value
-        if trade_value < 10:
-            return False, f"Trade value ${trade_value:.2f} below minimum $10"
+        # Rule 7: Minimum trade value (configurable - lower in paper mode)
+        if trade_value < MIN_TRADE_VALUE:
+            return False, f"Trade value ${trade_value:.2f} below minimum ${MIN_TRADE_VALUE:.0f}"
         
         logger.debug(f"Trade approved: {side} {quantity:.6f} {symbol} @ {price:.2f} (${trade_value:.2f}) [{strategy}]")
         return True, "Approved"
@@ -310,10 +309,10 @@ class RiskManager:
         # Max position limit
         max_size = (self.current_equity * MAX_POSITION_PCT / 100) / entry_price
         
-        # Consecutive loss adjustment
-        if self.consecutive_losses >= 3:
-            reduction = 1 - (self.consecutive_losses * 0.1)  # 10% reduction per loss
-            reduction = max(0.3, reduction)  # floor at 30% of normal
+        # Consecutive loss adjustment (less aggressive reduction)
+        if self.consecutive_losses >= 5:
+            reduction = 1 - (self.consecutive_losses * 0.05)  # 5% reduction per loss (was 10%)
+            reduction = max(0.5, reduction)  # floor at 50% of normal (was 30%)
             risk_size *= reduction
             alloc_size *= reduction
         

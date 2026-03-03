@@ -24,6 +24,7 @@ class BaseStrategy(ABC):
         self.active = True
         self.positions: Dict[str, Dict] = {}
         self._signals: List[Dict] = []
+        self.current_regime = 'RANGING'  # Updated by engine each regime cycle
         
         logger.info(f"Strategy [{name}] initialized | Allocation: {allocation*100:.0f}%")
     

@@ -47,7 +47,7 @@ class MarketRegimeDetector:
             'GRID': 0.30, 'MEAN_REV': 0.30, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
         },
         'CHOPPY': {
-            'GRID': 0.55, 'MEAN_REV': 0.40, 'MOMENTUM': 0.05, 'FUND_ARB': 0.00  # FIX-6: MOM doesn't work in chop
+            'GRID': 0.55, 'MEAN_REV': 0.45, 'MOMENTUM': 0.00, 'FUND_ARB': 0.00  # FIX-9: MOM fully off in chop (was 5% — too little to profit, enough to lose)
         },
         'RISK_OFF': {
             'GRID': 0.50, 'MEAN_REV': 0.10, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
@@ -60,6 +60,10 @@ class MarketRegimeDetector:
         self.last_analysis_time = 0
         self.analysis_interval = 1200  # 20 minutes
         self.history: list = []
+        # FIX-8: Regime hysteresis — prevent rapid flipping
+        # Mar 3: regime flipped 111 times (CHOPPY↔BULL every minute), causing whipsaw entries
+        self.last_regime_change_time = 0
+        self.min_regime_hold = 1800  # Hold regime for at least 30 min
         logger.info("Rule-Based Regime Detector initialized (GPT removed — biased bull 73%)")
 
     def detect_regime(self, market_data: Dict) -> Tuple[str, float, Dict]:
@@ -75,6 +79,20 @@ class MarketRegimeDetector:
         self.last_analysis_time = time.time()
 
         regime, confidence = self._rules_based_detect(market_data)
+
+        # FIX-8: Regime hysteresis — don't flip unless held for 30 min
+        # Exception: RISK_OFF and TRENDING_BEAR always override (safety)
+        if regime != self.current_regime:
+            time_in_current = time.time() - self.last_regime_change_time
+            emergency_override = regime in ('RISK_OFF', 'TRENDING_BEAR')
+            if time_in_current < self.min_regime_hold and not emergency_override:
+                logger.debug(f"[RULES] Regime would change to {regime} but holding {self.current_regime} "
+                           f"({time_in_current:.0f}s < {self.min_regime_hold}s hysteresis)")
+                regime = self.current_regime  # Keep current regime
+            else:
+                logger.info(f"[RULES] Regime changed: {self.current_regime} → {regime}")
+                self.last_regime_change_time = time.time()
+
         self.current_regime = regime
         self.confidence = confidence
         self.history.append({

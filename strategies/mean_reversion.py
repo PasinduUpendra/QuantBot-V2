@@ -45,6 +45,7 @@ class MeanReversionStrategy(BaseStrategy):
         self.open_positions: Dict[str, Dict] = {}
         self.cooldowns: Dict[str, float] = {}  # symbol -> last_trade_time
         self.cooldown_period = 600  # 10 min cooldown — stop overtrading
+        self.choppy_cooldown_period = 1800  # FIX-10: 30 min cooldown in CHOPPY (was 10min — 248 signals in one day)
     
     def analyze(self) -> List[Dict]:
         """Analyze pairs for mean reversion opportunities."""
@@ -56,9 +57,10 @@ class MeanReversionStrategy(BaseStrategy):
                 if df.empty or len(df) < MR_BB_PERIOD + 5:
                     continue
                 
-                # Skip if in cooldown
+                # Skip if in cooldown — FIX-10: longer cooldown in CHOPPY
+                effective_cooldown = self.choppy_cooldown_period if self.current_regime == 'CHOPPY' else self.cooldown_period
                 if symbol in self.cooldowns:
-                    if time.time() - self.cooldowns[symbol] < self.cooldown_period:
+                    if time.time() - self.cooldowns[symbol] < effective_cooldown:
                         continue
                 
                 # Calculate indicators
@@ -114,10 +116,16 @@ class MeanReversionStrategy(BaseStrategy):
                     if sma_slope < -0.1:  # FIX-5: Tightened from -0.3 — any SMA decline = no entry
                         continue
                 
+                # FIX-10: Tighter entry thresholds in CHOPPY
+                choppy_mode = self.current_regime == 'CHOPPY'
+                entry_pct_b = 0.03 if choppy_mode else 0.10     # Truly at the extreme in chop
+                entry_rsi = 25 if choppy_mode else MR_RSI_OVERSOLD  # Truly oversold in chop
+                entry_vol = 1.3 if choppy_mode else 1.0         # Need stronger volume in chop
+                
                 # LONG SIGNAL: Price near/below lower band + RSI oversold + volume spike
-                if (current_pct_b < 0.10 and 
-                    current_rsi < MR_RSI_OVERSOLD and
-                    vol_ratio > 1.0 and
+                if (current_pct_b < entry_pct_b and 
+                    current_rsi < entry_rsi and
+                    vol_ratio > entry_vol and
                     sma_slope > -0.1):  # FIX-5: Tightened from -0.5 — SMA must be flat or rising
                     
                     # Confluence score
@@ -130,7 +138,9 @@ class MeanReversionStrategy(BaseStrategy):
                     if self._is_bullish_reversal(df):
                         strength += 0.5
                     
-                    stop_loss = current_price - (current_atr * MR_ATR_STOP_MULT)
+                    # FIX-12: Wider stops in CHOPPY (more room for noise)
+                    atr_stop_mult = MR_ATR_STOP_MULT * 1.25 if choppy_mode else MR_ATR_STOP_MULT
+                    stop_loss = current_price - (current_atr * atr_stop_mult)
                     # Enforce minimum stop distance to avoid precision bugs
                     min_stop_dist = current_price * MR_MIN_STOP_DISTANCE_PCT / 100
                     if abs(current_price - stop_loss) < min_stop_dist:
@@ -190,7 +200,26 @@ class MeanReversionStrategy(BaseStrategy):
                         'bb_width': current_bb_width,
                     }
                 
-                if signal and signal['strength'] >= 1.5:  # Raised back — only high-confidence signals
+                # FIX-10: In CHOPPY, require much stronger confluence
+                # Mar 3: 248 MR signals, most were marginal and lost money
+                min_strength = 1.5
+                if self.current_regime == 'CHOPPY':
+                    min_strength = 2.0  # Only take very strong signals in chop
+                
+                # FIX-11: Minimum R:R check — don't enter if target is too close
+                # Mar 3: many wins were +$0.12-$0.57 while losses were -$1.42-$3.64
+                if signal:
+                    if signal['side'] == 'BUY':
+                        reward = signal['target'] - signal['entry']
+                        risk = signal['entry'] - signal['stop']
+                    else:
+                        reward = signal['entry'] - signal['target']
+                        risk = signal['stop'] - signal['entry']
+                    
+                    if risk > 0 and reward / risk < 1.5:
+                        signal = None  # R:R too poor, skip
+                
+                if signal and signal['strength'] >= min_strength:
                     signals.append(signal)
                     logger.info(f"[MR] Signal: {signal['side']} {symbol} | "
                               f"Strength: {signal['strength']:.2f} | "

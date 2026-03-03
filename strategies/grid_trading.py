@@ -40,6 +40,8 @@ class GridTradingStrategy(BaseStrategy):
         self.grids: Dict[str, Dict] = {}  # symbol -> grid_state
         self.grid_orders: Dict[str, List[Dict]] = {}  # symbol -> [orders]
         self.last_rebalance: Dict[str, float] = {}
+        self._rejection_cooldowns: Dict[str, float] = {}  # symbol -> last rejection log time
+        self._REJECTION_COOLDOWN = 300  # Only log rejections once per 5 min per symbol
         
     def analyze(self) -> List[Dict]:
         """Analyze each pair to determine optimal grid parameters."""
@@ -172,7 +174,11 @@ class GridTradingStrategy(BaseStrategy):
             symbol, 'BUY', size_per_level / price, price, 'GRID'
         )
         if not approved:
-            logger.warning(f"[GRID] Setup rejected for {symbol}: {reason}")
+            now = time.time()
+            last_log = self._rejection_cooldowns.get(symbol, 0)
+            if now - last_log > self._REJECTION_COOLDOWN:
+                logger.warning(f"[GRID] Setup rejected for {symbol}: {reason} (suppressing for 5min)")
+                self._rejection_cooldowns[symbol] = now
             return
         
         # Place buy orders below current price
