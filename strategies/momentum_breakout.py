@@ -30,7 +30,8 @@ from core import (
     MOM_TIMEFRAME, MOM_FAST_EMA, MOM_SLOW_EMA, MOM_TREND_EMA,
     MOM_ADX_PERIOD, MOM_ADX_THRESHOLD, MOM_VOLUME_MULT,
     MOM_ATR_PERIOD, MOM_ATR_STOP_MULT, MOM_ATR_TARGET_MULT,
-    MOM_TRAIL_ATR_MULT, MOM_MAX_POSITIONS, MOM_LOOKBACK_CANDLES
+    MOM_TRAIL_ATR_MULT, MOM_MAX_POSITIONS, MOM_LOOKBACK_CANDLES,
+    FUTURES_MODE
 )
 
 
@@ -124,68 +125,92 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 if vol_ratio < 1.0:
                     continue  # Below-average volume = no conviction
 
-                # DIRECTIONAL FILTER: Hard block — never BUY when bears dominate
-                if current_minus_di > current_plus_di:
-                    continue  # -DI > +DI means sellers in control
+                # DIRECTIONAL FILTER: Separate paths for bull vs bear
+                is_bearish_di = current_minus_di > current_plus_di
                 
-                # REGIME FILTER: In bear markets, require very strong momentum
+                # REGIME FILTER: In bear markets, require very strong momentum for LONGS
                 if self.current_regime in ('TRENDING_BEAR', 'RISK_OFF'):
-                    # Only enter if ADX very strong AND bullish DI dominant
-                    if current_adx < 30 or current_plus_di < current_minus_di * 1.5:
-                        continue
+                    if not is_bearish_di:
+                        # Trying to go long in bear — require very strong signal
+                        if current_adx < 30 or current_plus_di < current_minus_di * 1.5:
+                            continue
                 
-                # BULLISH MOMENTUM
-                bullish_conditions = [
-                    current_ema_fast > current_ema_slow,           # Fast above slow
-                    prev_ema_fast <= prev_ema_slow or              # Fresh crossover OR
-                    current_price > recent_high * 0.995,           # Near breakout
-                    current_price > current_ema_trend,             # Above trend EMA
-                    current_adx > MOM_ADX_THRESHOLD,               # Strong trend
-                    current_plus_di > current_minus_di * 1.2,      # Clear bullish DI gap
-                    vol_ratio > MOM_VOLUME_MULT,                   # Full volume confirmation
-                    current_macd_hist > 0,                         # MACD bullish
-                ]
-                
-                bullish_score = sum(bullish_conditions) / len(bullish_conditions)
-                
-                # BEARISH MOMENTUM (for exits / potential shorts)
-                bearish_conditions = [
-                    current_ema_fast < current_ema_slow,
-                    prev_ema_fast >= prev_ema_slow or
-                    current_price < recent_low * 1.005,
-                    current_price < current_ema_trend,
-                    current_adx > MOM_ADX_THRESHOLD,
-                    current_minus_di > current_plus_di,
-                    vol_ratio > MOM_VOLUME_MULT * 0.8,
-                    current_macd_hist < 0,
-                ]
-                
-                bearish_score = sum(bearish_conditions) / len(bearish_conditions)
-                
-                # Generate signal if strong enough
-                if bullish_score >= 0.70:  # Raised back — quality over quantity
-                    # Fresh crossover gets bonus
-                    is_fresh = prev_ema_fast <= prev_ema_slow and current_ema_fast > current_ema_slow
-                    strength = bullish_score * 2 + (0.5 if is_fresh else 0)
+                # BULLISH MOMENTUM (only when +DI > -DI)
+                if not is_bearish_di:
+                    bullish_conditions = [
+                        current_ema_fast > current_ema_slow,           # Fast above slow
+                        prev_ema_fast <= prev_ema_slow or              # Fresh crossover OR
+                        current_price > recent_high * 0.995,           # Near breakout
+                        current_price > current_ema_trend,             # Above trend EMA
+                        current_adx > MOM_ADX_THRESHOLD,               # Strong trend
+                        current_plus_di > current_minus_di * 1.2,      # Clear bullish DI gap
+                        vol_ratio > MOM_VOLUME_MULT,                   # Full volume confirmation
+                        current_macd_hist > 0,                         # MACD bullish
+                    ]
                     
-                    stop_loss = current_price - (current_atr * MOM_ATR_STOP_MULT)
-                    take_profit = current_price + (current_atr * MOM_ATR_TARGET_MULT)
+                    bullish_score = sum(bullish_conditions) / len(bullish_conditions)
                     
-                    signal = {
-                        'symbol': symbol,
-                        'side': 'BUY',
-                        'strength': strength,
-                        'entry': current_price,
-                        'stop': stop_loss,
-                        'target': take_profit,
-                        'adx': current_adx,
-                        'ema_fast': current_ema_fast,
-                        'ema_slow': current_ema_slow,
-                        'vol_ratio': vol_ratio,
-                        'atr': current_atr,
-                        'is_fresh_crossover': is_fresh,
-                        'macd_hist': current_macd_hist,
-                    }
+                    if bullish_score >= 0.70:
+                        is_fresh = prev_ema_fast <= prev_ema_slow and current_ema_fast > current_ema_slow
+                        strength = bullish_score * 2 + (0.5 if is_fresh else 0)
+                        
+                        stop_loss = current_price - (current_atr * MOM_ATR_STOP_MULT)
+                        take_profit = current_price + (current_atr * MOM_ATR_TARGET_MULT)
+                        
+                        signal = {
+                            'symbol': symbol,
+                            'side': 'BUY',
+                            'strength': strength,
+                            'entry': current_price,
+                            'stop': stop_loss,
+                            'target': take_profit,
+                            'adx': current_adx,
+                            'ema_fast': current_ema_fast,
+                            'ema_slow': current_ema_slow,
+                            'vol_ratio': vol_ratio,
+                            'atr': current_atr,
+                            'is_fresh_crossover': is_fresh,
+                            'macd_hist': current_macd_hist,
+                        }
+                
+                # BEARISH MOMENTUM — SHORT signals (Futures only)
+                if FUTURES_MODE and is_bearish_di:
+                    bearish_conditions = [
+                        current_ema_fast < current_ema_slow,           # Fast below slow
+                        prev_ema_fast >= prev_ema_slow or              # Fresh crossover OR
+                        current_price < recent_low * 1.005,            # Near breakdown
+                        current_price < current_ema_trend,             # Below trend EMA
+                        current_adx > MOM_ADX_THRESHOLD,               # Strong trend
+                        current_minus_di > current_plus_di * 1.2,      # Clear bearish DI gap
+                        vol_ratio > MOM_VOLUME_MULT * 0.8,             # Volume confirmation (slightly relaxed for shorts)
+                        current_macd_hist < 0,                         # MACD bearish
+                    ]
+                    
+                    bearish_score = sum(bearish_conditions) / len(bearish_conditions)
+                    
+                    # Only SHORT in regimes where bears have control
+                    if bearish_score >= 0.70 and self.current_regime in ('TRENDING_BEAR', 'HIGH_VOLATILITY', 'RISK_OFF', 'CHOPPY'):
+                        is_fresh = prev_ema_fast >= prev_ema_slow and current_ema_fast < current_ema_slow
+                        strength = bearish_score * 2 + (0.5 if is_fresh else 0)
+                        
+                        stop_loss = current_price + (current_atr * MOM_ATR_STOP_MULT)
+                        take_profit = current_price - (current_atr * MOM_ATR_TARGET_MULT)
+                        
+                        signal = {
+                            'symbol': symbol,
+                            'side': 'SELL',
+                            'strength': strength,
+                            'entry': current_price,
+                            'stop': stop_loss,
+                            'target': take_profit,
+                            'adx': current_adx,
+                            'ema_fast': current_ema_fast,
+                            'ema_slow': current_ema_slow,
+                            'vol_ratio': vol_ratio,
+                            'atr': current_atr,
+                            'is_fresh_crossover': is_fresh,
+                            'macd_hist': current_macd_hist,
+                        }
                 
                 if signal and signal['strength'] >= 1.3:  # Raised back — high confidence only
                     signals.append(signal)
@@ -232,7 +257,8 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 logger.debug(f"[MOM] Skipping {symbol}: global entry cooldown ({self.global_entry_spacing}s)")
                 break
             
-            if signal['side'] != 'BUY':
+            # Block SHORT signals if Futures mode is not enabled
+            if signal['side'] == 'SELL' and not FUTURES_MODE:
                 continue
             
             try:
@@ -252,12 +278,20 @@ class MomentumBreakoutStrategy(BaseStrategy):
                     logger.debug(f"[MOM] Rejected {symbol}: {reason}")
                     continue
                 
-                usdt_amount = position_size * signal['entry']
-                order = self.exchange.market_buy(symbol, usdt_amount)
+                # Execute based on side
+                if signal['side'] == 'BUY':
+                    usdt_amount = position_size * signal['entry']
+                    if FUTURES_MODE:
+                        order = self.exchange.futures_market_open(symbol, 'BUY', position_size)
+                    else:
+                        order = self.exchange.market_buy(symbol, usdt_amount)
+                else:
+                    # SELL = open SHORT via Futures
+                    order = self.exchange.futures_market_open(symbol, 'SELL', position_size)
                 
                 if order.get('status') == 'FILLED' or order.get('orderId'):
                     self.open_positions[symbol] = {
-                        'side': 'BUY',
+                        'side': signal['side'],
                         'entry_price': signal['entry'],
                         'quantity': position_size,
                         'stop_loss': signal['stop'],
@@ -267,24 +301,25 @@ class MomentumBreakoutStrategy(BaseStrategy):
                         'signal_strength': signal['strength'],
                         'atr': signal['atr'],
                         'highest_price': signal['entry'],
+                        'lowest_price': signal['entry'],  # Track for SHORT trailing
                     }
                     
                     self.risk.register_position(
-                        symbol, 'BUY', position_size, signal['entry'], 'MOMENTUM',
+                        symbol, signal['side'], position_size, signal['entry'], 'MOMENTUM',
                         signal['stop'], signal['target']
                     )
                     
                     self.cooldowns[symbol] = time.time()
-                    self.last_global_entry_time = time.time()  # FIX-4: Update global timer
-                    entries_this_cycle += 1  # FIX-4: Count entries this cycle
+                    self.last_global_entry_time = time.time()
+                    entries_this_cycle += 1
                     
-                    logger.info(f"[MOM] ENTERED: BUY {position_size:.6f} {symbol} @ {signal['entry']:.2f}")
+                    logger.info(f"[MOM] ENTERED: {signal['side']} {position_size:.6f} {symbol} @ {signal['entry']:.2f}")
                     
             except Exception as e:
                 logger.error(f"[MOM] Error executing {symbol}: {e}")
     
     def manage_positions(self):
-        """Manage momentum positions with trailing stops."""
+        """Manage momentum positions with trailing stops (LONG and SHORT)."""
         for symbol in list(self.open_positions.keys()):
             try:
                 pos = self.open_positions[symbol]
@@ -298,48 +333,145 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 should_exit = False
                 exit_reason = ""
                 
-                # Update highest price
-                if current_price > pos['highest_price']:
-                    pos['highest_price'] = current_price
+                is_short = pos['side'] == 'SELL'
                 
-                # Trailing stop logic
-                trail_distance = pos['atr'] * MOM_TRAIL_ATR_MULT
-                new_trail = pos['highest_price'] - trail_distance
-                
-                if new_trail > pos['trail_stop']:
-                    pos['trail_stop'] = new_trail
-                
-                # Use the higher of initial stop and trailing stop
-                effective_stop = max(pos['stop_loss'], pos['trail_stop'])
-                
-                # Check stops
-                if current_price <= effective_stop:
-                    should_exit = True
-                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
-                    exit_reason = f"{'Trailing' if pos['trail_stop'] > pos['stop_loss'] else 'Initial'} stop ({pnl_pct:+.2f}%)"
-                
-                # Check take profit (but trail beyond if trend is strong)
-                elif current_price >= pos['take_profit']:
-                    # Instead of taking profit immediately, move stop to lock in gains
-                    new_stop = current_price - (pos['atr'] * MOM_TRAIL_ATR_MULT * 0.8)
-                    if new_stop > pos['trail_stop']:
-                        pos['trail_stop'] = new_stop
-                        # Extend target
-                        pos['take_profit'] = current_price + (pos['atr'] * MOM_ATR_TARGET_MULT * 0.5)
-                        logger.info(f"[MOM] {symbol} target extended, trail moved to {new_stop:.2f}")
-                
-                # Time-based: force exit after 24h
-                elif time.time() - pos['entry_time'] > 86400:
-                    should_exit = True
-                    exit_reason = "24h time limit"
-                
-                if should_exit:
-                    order = self.exchange.market_sell(symbol, pos['quantity'])
+                if is_short:
+                    # ===== SHORT POSITION MANAGEMENT =====
+                    # Track lowest price (best price for shorts)
+                    if current_price < pos.get('lowest_price', pos['entry_price']):
+                        pos['lowest_price'] = current_price
                     
-                    if order.get('status') == 'FILLED' or order.get('orderId'):
-                        self.risk.close_position(symbol, current_price, exit_reason)
-                        del self.open_positions[symbol]
-                        logger.info(f"[MOM] EXITED: {symbol} @ {current_price:.2f} | {exit_reason}")
+                    curr_pnl_pct = (pos['entry_price'] - current_price) / pos['entry_price'] * 100
+                    max_pnl_pct = (pos['entry_price'] - pos['lowest_price']) / pos['entry_price'] * 100
+                    
+                    # Dynamic ATR multiplier based on profit (mirror of LONG ratchet)
+                    if max_pnl_pct >= 4.0:
+                        current_trail_mult = 0.4
+                    elif max_pnl_pct >= 2.5:
+                        current_trail_mult = 0.6
+                    elif max_pnl_pct >= 1.5:
+                        current_trail_mult = 0.8
+                    elif max_pnl_pct >= 0.8:
+                        current_trail_mult = 1.0
+                    else:
+                        if time.time() - pos['entry_time'] < 900:
+                            current_trail_mult = MOM_TRAIL_ATR_MULT * 0.8
+                        else:
+                            current_trail_mult = MOM_TRAIL_ATR_MULT
+                    
+                    trail_distance = pos['atr'] * current_trail_mult
+                    new_trail = pos['lowest_price'] + trail_distance  # Trail ABOVE for shorts
+                    
+                    # HARD LOCK: If max profit > 1.5%, never let it go red
+                    if max_pnl_pct >= 1.5:
+                        breakeven_minus = pos['entry_price'] * 0.998  # -0.2%
+                        new_trail = min(new_trail, breakeven_minus)
+                    
+                    if new_trail < pos['trail_stop']:
+                        pos['trail_stop'] = new_trail
+                    
+                    # Effective stop is the LOWER of initial stop and trail (for shorts, stop is above)
+                    effective_stop = min(pos['stop_loss'], pos['trail_stop'])
+                    
+                    # Check stops (SHORT: price going UP = bad)
+                    if current_price >= effective_stop:
+                        should_exit = True
+                        exit_reason = f"{'Trailing' if pos['trail_stop'] < pos['stop_loss'] else 'Initial'} stop ({curr_pnl_pct:+.2f}%)"
+                    
+                    # Check take profit (price below target)
+                    elif current_price <= pos['take_profit']:
+                        new_stop = current_price + (pos['atr'] * MOM_TRAIL_ATR_MULT * 0.8)
+                        if new_stop < pos['trail_stop']:
+                            pos['trail_stop'] = new_stop
+                            pos['take_profit'] = current_price - (pos['atr'] * MOM_ATR_TARGET_MULT * 0.5)
+                            logger.info(f"[MOM] {symbol} SHORT target extended, trail moved to {new_stop:.2f}")
+                    
+                    # 30-MIN DEAD ZONE ESCAPE (symmetric for shorts)
+                    elif time.time() - pos['entry_time'] > 1800:
+                        if -0.3 <= curr_pnl_pct <= 0.15:
+                            should_exit = True
+                            exit_reason = f"Stale exit (dead zone, {curr_pnl_pct:+.2f}%)"
+                        elif time.time() - pos['entry_time'] > 86400:
+                            should_exit = True
+                            exit_reason = "24h time limit"
+                    
+                    if should_exit:
+                        # Close SHORT = BUY to close
+                        if FUTURES_MODE:
+                            order = self.exchange.futures_market_close(symbol, 'BUY', pos['quantity'])
+                        else:
+                            order = self.exchange.market_buy(symbol, pos['quantity'] * current_price)
+                        
+                        if order.get('status') == 'FILLED' or order.get('orderId'):
+                            self.risk.close_position(symbol, current_price, exit_reason)
+                            del self.open_positions[symbol]
+                            logger.info(f"[MOM] EXITED SHORT: {symbol} @ {current_price:.2f} | {exit_reason}")
+                
+                else:
+                    # ===== LONG POSITION MANAGEMENT (existing logic) =====
+                    # Update highest price
+                    if current_price > pos['highest_price']:
+                        pos['highest_price'] = current_price
+                    
+                    curr_pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
+                    max_pnl_pct = (pos['highest_price'] - pos['entry_price']) / pos['entry_price'] * 100
+                    
+                    # Dynamic ATR multiplier based on profit
+                    if max_pnl_pct >= 4.0:
+                        current_trail_mult = 0.4
+                    elif max_pnl_pct >= 2.5:
+                        current_trail_mult = 0.6
+                    elif max_pnl_pct >= 1.5:
+                        current_trail_mult = 0.8
+                    elif max_pnl_pct >= 0.8:
+                        current_trail_mult = 1.0
+                    else:
+                        if time.time() - pos['entry_time'] < 900:
+                            current_trail_mult = MOM_TRAIL_ATR_MULT * 0.8
+                        else:
+                            current_trail_mult = MOM_TRAIL_ATR_MULT
+                        
+                    trail_distance = pos['atr'] * current_trail_mult
+                    new_trail = pos['highest_price'] - trail_distance
+                    
+                    if max_pnl_pct >= 1.5:
+                        breakeven_plus = pos['entry_price'] * 1.002
+                        new_trail = max(new_trail, breakeven_plus)
+                    
+                    if new_trail > pos['trail_stop']:
+                        pos['trail_stop'] = new_trail
+                    
+                    effective_stop = max(pos['stop_loss'], pos['trail_stop'])
+                    
+                    if current_price <= effective_stop:
+                        should_exit = True
+                        exit_reason = f"{'Trailing' if pos['trail_stop'] > pos['stop_loss'] else 'Initial'} stop ({curr_pnl_pct:+.2f}%)"
+                    
+                    elif current_price >= pos['take_profit']:
+                        new_stop = current_price - (pos['atr'] * MOM_TRAIL_ATR_MULT * 0.8)
+                        if new_stop > pos['trail_stop']:
+                            pos['trail_stop'] = new_stop
+                            pos['take_profit'] = current_price + (pos['atr'] * MOM_ATR_TARGET_MULT * 0.5)
+                            logger.info(f"[MOM] {symbol} target extended, trail moved to {new_stop:.2f}")
+                    
+                    elif time.time() - pos['entry_time'] > 1800:
+                        if -0.3 <= curr_pnl_pct <= 0.15:
+                            should_exit = True
+                            exit_reason = f"Stale exit (dead zone, {curr_pnl_pct:+.2f}%)"
+                        elif time.time() - pos['entry_time'] > 86400:
+                            should_exit = True
+                            exit_reason = "24h time limit"
+                    
+                    if should_exit:
+                        if FUTURES_MODE:
+                            order = self.exchange.futures_market_close(symbol, 'SELL', pos['quantity'])
+                        else:
+                            order = self.exchange.market_sell(symbol, pos['quantity'])
+                        
+                        if order.get('status') == 'FILLED' or order.get('orderId'):
+                            self.risk.close_position(symbol, current_price, exit_reason)
+                            del self.open_positions[symbol]
+                            logger.info(f"[MOM] EXITED: {symbol} @ {current_price:.2f} | {exit_reason}")
                         
             except Exception as e:
                 logger.error(f"[MOM] Error managing {symbol}: {e}")

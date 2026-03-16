@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
-from core import BINANCE_API_KEY, BINANCE_SECRET_KEY, PAPER_TRADE
+from core import BINANCE_API_KEY, BINANCE_SECRET_KEY, PAPER_TRADE, FUTURES_MODE, FUTURES_LEVERAGE
 
 
 class BinanceConnector:
@@ -56,6 +56,12 @@ class BinanceConnector:
         self._paper_orders: List[Dict] = []
         self._paper_positions: Dict[str, Dict] = {}
         self._paper_order_id = 10000
+        
+        # Paper futures state (SHORT position tracking)
+        self._paper_futures_positions: Dict[str, Dict] = {}  # symbol -> {side, qty, entry, leverage, margin}
+        
+        # Futures initialization state
+        self._futures_leverage_set: Dict[str, int] = {}  # symbol -> leverage
         
         logger.info("BinanceConnector initialized")
     
@@ -166,7 +172,7 @@ class BinanceConnector:
         return float(usdt)
     
     def get_total_equity_usdt(self) -> float:
-        """Calculate total portfolio value in USDT."""
+        """Calculate total portfolio value in USDT including futures positions."""
         if PAPER_TRADE:
             total = self._paper_balance.get('USDT', 0)
             for symbol, qty in self._paper_balance.items():
@@ -174,6 +180,14 @@ class BinanceConnector:
                     price = self.get_price(f'{symbol}USDT')
                     if price:
                         total += qty * price
+            # Add unrealized PnL from paper futures positions
+            for symbol, pos in self._paper_futures_positions.items():
+                price = self.get_price(symbol)
+                if price:
+                    if pos['side'] == 'SHORT':
+                        total += (pos['entry_price'] - price) * pos['quantity']
+                    elif pos['side'] == 'LONG':
+                        total += (price - pos['entry_price']) * pos['quantity']
             return total
         
         balances = self.get_account_balance()
@@ -517,26 +531,20 @@ class BinanceConnector:
         if order_type == 'MARKET':
             # Execute immediately
             if side == 'BUY':
-                if self._paper_balance.get(quote_asset, 0) >= cost:
-                    self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) - cost
-                    self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) + quantity
-                    # Simulate 0.1% fee
-                    self._paper_balance[base_asset] -= quantity * 0.001
-                    order['status'] = 'FILLED'
-                    logger.info(f"[PAPER] BUY {quantity:.6f} {base_asset} @ {exec_price:.2f} = ${cost:.2f}")
-                else:
-                    order['status'] = 'REJECTED'
-                    logger.warning(f"[PAPER] Insufficient {quote_asset}: need {cost:.2f}, have {self._paper_balance.get(quote_asset, 0):.2f}")
+                # Bypass balance limits to simulate futures margin
+                self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 1000) - cost
+                self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) + quantity
+                # Simulate 0.1% fee
+                self._paper_balance[base_asset] -= quantity * 0.001
+                order['status'] = 'FILLED'
+                logger.info(f"[PAPER MARGIN] BUY {quantity:.6f} {base_asset} @ {exec_price:.2f} = ${cost:.2f}")
             else:  # SELL
-                if self._paper_balance.get(base_asset, 0) >= quantity:
-                    self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) - quantity
-                    revenue = cost * 0.999  # 0.1% fee
-                    self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 0) + revenue
-                    order['status'] = 'FILLED'
-                    logger.info(f"[PAPER] SELL {quantity:.6f} {base_asset} @ {exec_price:.2f} = ${revenue:.2f}")
-                else:
-                    order['status'] = 'REJECTED'
-                    logger.warning(f"[PAPER] Insufficient {base_asset}: need {quantity:.6f}, have {self._paper_balance.get(base_asset, 0):.6f}")
+                # Bypass balance limits to simulate futures shorting / margin
+                self._paper_balance[base_asset] = self._paper_balance.get(base_asset, 0) - quantity
+                revenue = cost * 0.999  # 0.1% fee
+                self._paper_balance[quote_asset] = self._paper_balance.get(quote_asset, 1000) + revenue
+                order['status'] = 'FILLED'
+                logger.info(f"[PAPER MARGIN] SELL {quantity:.6f} {base_asset} @ {exec_price:.2f} = ${revenue:.2f}")
         else:
             # Limit order - add to pending
             self._paper_orders.append(order)
@@ -607,6 +615,215 @@ class BinanceConnector:
     def limit_sell(self, symbol: str, quantity: float, price: float) -> Dict:
         """Place limit sell order."""
         return self.place_order(symbol, 'SELL', 'LIMIT', quantity=quantity, price=price)
+    
+    # ================================================================
+    # FUTURES ORDER MANAGEMENT
+    # ================================================================
+    
+    def set_leverage(self, symbol: str, leverage: int) -> Dict:
+        """Set leverage for a futures symbol."""
+        if PAPER_TRADE:
+            self._futures_leverage_set[symbol] = leverage
+            logger.info(f"[PAPER] Set leverage {leverage}x for {symbol}")
+            return {'leverage': leverage, 'symbol': symbol}
+        
+        return self._request('POST', f'{self.FUTURES_URL}/fapi/v1/leverage',
+                            signed=True, params={'symbol': symbol, 'leverage': leverage})
+    
+    def set_margin_type(self, symbol: str, margin_type: str = 'ISOLATED') -> Dict:
+        """Set margin type (ISOLATED or CROSSED) for a futures symbol."""
+        if PAPER_TRADE:
+            logger.info(f"[PAPER] Set margin type {margin_type} for {symbol}")
+            return {'symbol': symbol, 'marginType': margin_type}
+        
+        result = self._request('POST', f'{self.FUTURES_URL}/fapi/v1/marginType',
+                              signed=True, params={'symbol': symbol, 'marginType': margin_type})
+        # Binance returns error if already set to this type — that's OK
+        if 'error' in result and 'No need to change' in str(result.get('error', '')):
+            return {'symbol': symbol, 'marginType': margin_type}
+        return result
+    
+    def get_futures_balance(self) -> float:
+        """Get USDT balance on Futures account."""
+        if PAPER_TRADE:
+            return self._paper_balance.get('USDT', 0)
+        
+        data = self._request('GET', f'{self.FUTURES_URL}/fapi/v2/balance', signed=True, weight=5)
+        if 'error' in data or not isinstance(data, list):
+            return 0
+        
+        for item in data:
+            if item.get('asset') == 'USDT':
+                return float(item.get('balance', 0))
+        return 0
+    
+    def get_futures_positions(self) -> List[Dict]:
+        """Get open futures positions."""
+        if PAPER_TRADE:
+            positions = []
+            for symbol, pos in self._paper_futures_positions.items():
+                price = self.get_price(symbol)
+                unrealized = 0
+                if price:
+                    if pos['side'] == 'SHORT':
+                        unrealized = (pos['entry_price'] - price) * pos['quantity']
+                    else:
+                        unrealized = (price - pos['entry_price']) * pos['quantity']
+                positions.append({
+                    'symbol': symbol,
+                    'positionSide': pos['side'],
+                    'positionAmt': pos['quantity'] if pos['side'] == 'LONG' else -pos['quantity'],
+                    'entryPrice': pos['entry_price'],
+                    'unRealizedProfit': unrealized,
+                    'leverage': pos['leverage'],
+                    'marginType': 'isolated',
+                })
+            return positions
+        
+        data = self._request('GET', f'{self.FUTURES_URL}/fapi/v2/positionRisk',
+                            signed=True, weight=5)
+        if 'error' in data or not isinstance(data, list):
+            return []
+        return [p for p in data if float(p.get('positionAmt', 0)) != 0]
+    
+    def place_futures_order(self, symbol: str, side: str, order_type: str,
+                           quantity: float, price: float = None,
+                           reduce_only: bool = False) -> Dict:
+        """
+        Place a futures order.
+        
+        Args:
+            symbol: Trading pair (e.g., 'BTCUSDT')
+            side: 'BUY' or 'SELL'
+            order_type: 'MARKET' or 'LIMIT'
+            quantity: Base asset quantity
+            price: Limit price (required for LIMIT orders)
+            reduce_only: True for closing positions
+        """
+        if PAPER_TRADE:
+            return self._paper_place_futures_order(symbol, side, order_type,
+                                                   quantity, price, reduce_only)
+        
+        params = {
+            'symbol': symbol,
+            'side': side,
+            'type': order_type,
+            'quantity': f'{self.round_quantity(symbol, quantity)}',
+        }
+        
+        if reduce_only:
+            params['reduceOnly'] = 'true'
+        
+        if price and order_type != 'MARKET':
+            params['price'] = f'{self.round_price(symbol, price)}'
+            params['timeInForce'] = 'GTC'
+        
+        logger.info(f"Placing futures order: {side} {quantity} {symbol} @ {price or 'MARKET'} "
+                   f"{'(reduceOnly)' if reduce_only else ''}")
+        
+        result = self._request('POST', f'{self.FUTURES_URL}/fapi/v1/order',
+                              signed=True, params=params)
+        
+        if 'error' not in result:
+            logger.info(f"Futures order placed: {result.get('orderId')} - {result.get('status')}")
+        else:
+            logger.error(f"Futures order failed: {result}")
+        
+        return result
+    
+    def _paper_place_futures_order(self, symbol: str, side: str, order_type: str,
+                                   quantity: float, price: float = None,
+                                   reduce_only: bool = False) -> Dict:
+        """Simulate futures order execution for paper trading."""
+        current_price = self.get_price(symbol)
+        if not current_price:
+            return {'error': f'Cannot get price for {symbol}'}
+        
+        exec_price = price if (price and order_type != 'MARKET') else current_price
+        leverage = self._futures_leverage_set.get(symbol, FUTURES_LEVERAGE)
+        notional = quantity * exec_price
+        margin = notional / leverage
+        fee = notional * 0.0004  # 0.04% taker fee for futures
+        
+        self._paper_order_id += 1
+        order = {
+            'orderId': self._paper_order_id,
+            'symbol': symbol,
+            'side': side,
+            'type': order_type,
+            'quantity': quantity,
+            'price': exec_price,
+            'status': 'NEW',
+            'time': int(time.time() * 1000),
+        }
+        
+        if order_type == 'MARKET':
+            if reduce_only:
+                # Closing a position
+                if symbol in self._paper_futures_positions:
+                    pos = self._paper_futures_positions[symbol]
+                    if pos['side'] == 'SHORT':
+                        pnl = (pos['entry_price'] - exec_price) * pos['quantity']
+                    else:
+                        pnl = (exec_price - pos['entry_price']) * pos['quantity']
+                    # Return margin + PnL - fees
+                    self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) + pos['margin'] + pnl - fee
+                    logger.info(f"[PAPER FUTURES] CLOSE {pos['side']} {pos['quantity']:.6f} {symbol} "
+                               f"@ {exec_price:.2f} | PnL: ${pnl:+.2f} | Fee: ${fee:.2f}")
+                    del self._paper_futures_positions[symbol]
+                order['status'] = 'FILLED'
+            elif side == 'SELL':
+                # Opening a SHORT position
+                self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) - margin - fee
+                liq_price = exec_price * (1 + 1.0 / leverage)  # Simplified liquidation
+                self._paper_futures_positions[symbol] = {
+                    'side': 'SHORT',
+                    'quantity': quantity,
+                    'entry_price': exec_price,
+                    'leverage': leverage,
+                    'margin': margin,
+                    'liquidation_price': liq_price,
+                    'entry_time': time.time(),
+                }
+                order['status'] = 'FILLED'
+                logger.info(f"[PAPER FUTURES] SHORT {quantity:.6f} {symbol} @ {exec_price:.2f} "
+                           f"| Margin: ${margin:.2f} | Lev: {leverage}x | Liq: {liq_price:.2f}")
+            elif side == 'BUY':
+                # Opening a LONG position (futures)
+                self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) - margin - fee
+                liq_price = exec_price * (1 - 1.0 / leverage)  # Simplified liquidation
+                self._paper_futures_positions[symbol] = {
+                    'side': 'LONG',
+                    'quantity': quantity,
+                    'entry_price': exec_price,
+                    'leverage': leverage,
+                    'margin': margin,
+                    'liquidation_price': liq_price,
+                    'entry_time': time.time(),
+                }
+                order['status'] = 'FILLED'
+                logger.info(f"[PAPER FUTURES] LONG {quantity:.6f} {symbol} @ {exec_price:.2f} "
+                           f"| Margin: ${margin:.2f} | Lev: {leverage}x | Liq: {liq_price:.2f}")
+        
+        return order
+    
+    # ================================================================
+    # FUTURES CONVENIENCE METHODS
+    # ================================================================
+    
+    def futures_market_open(self, symbol: str, side: str, quantity: float) -> Dict:
+        """Open a futures position at market price."""
+        return self.place_futures_order(symbol, side, 'MARKET', quantity)
+    
+    def futures_market_close(self, symbol: str, side: str, quantity: float) -> Dict:
+        """Close a futures position at market price. Side is the CLOSING side (opposite of position)."""
+        return self.place_futures_order(symbol, side, 'MARKET', quantity, reduce_only=True)
+    
+    def init_futures_symbol(self, symbol: str, leverage: int = None):
+        """Initialize a futures symbol with leverage and margin type."""
+        lev = leverage or FUTURES_LEVERAGE
+        self.set_leverage(symbol, lev)
+        self.set_margin_type(symbol, 'ISOLATED')
     
     def get_server_time(self) -> int:
         """Get Binance server time."""

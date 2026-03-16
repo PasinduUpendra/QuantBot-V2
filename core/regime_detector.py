@@ -32,25 +32,27 @@ class MarketRegimeDetector:
     REGIMES = ['TRENDING_BULL', 'TRENDING_BEAR', 'RANGING', 'HIGH_VOLATILITY', 'CHOPPY', 'RISK_OFF']
 
     # Strategy weights per regime
-    # FIX-6 applied: CHOPPY MOM slashed from 25% → 5%
+    # Phase 1: Grid permanently disabled (0% in .env) — all weight redistributed to MR+MOM
+    # CHOPPY: MOM stays 0 (proven to lose in chop). MR gets 100% since it's the only active strategy.
+    # RISK_OFF: MOM allocation reserved for future short capability.
     REGIME_WEIGHTS = {
         'TRENDING_BULL': {
-            'GRID': 0.15, 'MEAN_REV': 0.25, 'MOMENTUM': 0.60, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.25, 'MOMENTUM': 0.75, 'FUND_ARB': 0.00
         },
         'TRENDING_BEAR': {
-            'GRID': 0.50, 'MEAN_REV': 0.10, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.60, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
         },
         'RANGING': {
-            'GRID': 0.40, 'MEAN_REV': 0.40, 'MOMENTUM': 0.20, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.55, 'MOMENTUM': 0.45, 'FUND_ARB': 0.00
         },
         'HIGH_VOLATILITY': {
-            'GRID': 0.30, 'MEAN_REV': 0.30, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.40, 'MOMENTUM': 0.60, 'FUND_ARB': 0.00
         },
         'CHOPPY': {
-            'GRID': 0.55, 'MEAN_REV': 0.45, 'MOMENTUM': 0.00, 'FUND_ARB': 0.00  # FIX-9: MOM fully off in chop (was 5% — too little to profit, enough to lose)
+            'GRID': 0.00, 'MEAN_REV': 1.00, 'MOMENTUM': 0.00, 'FUND_ARB': 0.00
         },
         'RISK_OFF': {
-            'GRID': 0.50, 'MEAN_REV': 0.10, 'MOMENTUM': 0.40, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.30, 'MOMENTUM': 0.70, 'FUND_ARB': 0.00
         },
     }
 

@@ -22,7 +22,9 @@ from core import (
     PAPER_TRADE, DAILY_TARGET_PCT, HEARTBEAT_INTERVAL,
     LOG_DIR, DATA_DIR, LOG_LEVEL,
     GRID_ALLOCATION, MEAN_REVERSION_ALLOCATION,
-    MOMENTUM_ALLOCATION, FUNDING_ARB_ALLOCATION
+    MOMENTUM_ALLOCATION, FUNDING_ARB_ALLOCATION,
+    FUTURES_MODE, FUTURES_LEVERAGE,
+    PRIMARY_PAIRS, MOMENTUM_PAIRS, MEAN_REVERSION_PAIRS
 )
 from core.exchange import BinanceConnector
 from core.risk_manager import RiskManager
@@ -79,10 +81,11 @@ class HydraEngine:
     
     def __init__(self):
         logger.info("=" * 70)
-        logger.info("    HYDRA QUANTITATIVE TRADING SYSTEM v2.0")
+        logger.info("    HYDRA QUANTITATIVE TRADING SYSTEM v3.0")
         logger.info("    'Survive. Compound. Dominate.'")
         logger.info("=" * 70)
         logger.info(f"    Mode: {'PAPER TRADING' if PAPER_TRADE else 'LIVE TRADING'}")
+        logger.info(f"    Futures: {'ON (' + str(FUTURES_LEVERAGE) + 'x leverage)' if FUTURES_MODE else 'OFF (spot only)'}")
         logger.info(f"    Target: {DAILY_TARGET_PCT:.2f}% daily (2x every 12 days)")
         logger.info(f"    Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info("=" * 70)
@@ -110,6 +113,10 @@ class HydraEngine:
         self.strategies['FUND_ARB'].active = False
         logger.warning("[ENGINE] FUND_ARB DISABLED — no futures trading permissions")
         
+        # Initialize Futures symbols if in Futures mode
+        if FUTURES_MODE:
+            self._init_futures_symbols()
+        
         # Timing
         self.last_run: Dict[str, float] = {k: 0 for k in self.INTERVALS}
         self.start_time = time.time()
@@ -129,6 +136,14 @@ class HydraEngine:
         self.perf_log_file = DATA_DIR / 'performance.jsonl'
         
         logger.info("HYDRA Engine initialized successfully")
+    
+    def _init_futures_symbols(self):
+        """Initialize all trading pairs for Futures (set leverage + margin type)."""
+        all_pairs = set(MOMENTUM_PAIRS + MEAN_REVERSION_PAIRS)
+        logger.info(f"[FUTURES] Initializing {len(all_pairs)} symbols with {FUTURES_LEVERAGE}x leverage...")
+        for symbol in all_pairs:
+            self.exchange.init_futures_symbol(symbol, FUTURES_LEVERAGE)
+        logger.info("[FUTURES] All symbols initialized")
     
     def _init_capital(self):
         """Initialize capital - detect from Binance or set paper amount."""
@@ -291,7 +306,8 @@ class HydraEngine:
             regime, confidence, weights = self.regime_detector.detect_regime(market_data)
             
             # Adjust strategy allocations based on regime
-            if confidence > 0.5:
+            # Fixed: was > 0.5, but default CHOPPY returns exactly 0.50, causing weights to never apply
+            if confidence >= 0.5:
                 for strat_name, weight in weights.items():
                     if strat_name in self.strategies:
                         old_alloc = self.strategies[strat_name].allocation
@@ -300,6 +316,9 @@ class HydraEngine:
                         if abs(old_alloc - weight) > 0.05:
                             logger.info(f"[REGIME] {strat_name} allocation: "
                                       f"{old_alloc*100:.0f}% → {weight*100:.0f}%")
+                
+                # Update risk manager regime for adaptive sizing
+                self.risk.current_regime = regime
                 
                 logger.info(f"[REGIME] Current: {regime} (confidence: {confidence:.0%})")
             

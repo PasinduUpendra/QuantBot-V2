@@ -15,7 +15,8 @@ from loguru import logger
 
 from core import (
     MAX_DRAWDOWN_PCT, DAILY_LOSS_LIMIT_PCT, MAX_POSITION_PCT,
-    MAX_TOTAL_EXPOSURE_PCT, RISK_PER_TRADE_PCT, MIN_TRADE_VALUE, DATA_DIR
+    MAX_TOTAL_EXPOSURE_PCT, RISK_PER_TRADE_PCT, MIN_TRADE_VALUE, DATA_DIR,
+    FUTURES_MODE, FUTURES_LEVERAGE
 )
 
 
@@ -61,12 +62,17 @@ class RiskManager:
         self.consecutive_losses = 0
         self.max_consecutive_losses = 0
         
+        # Adaptive risk state
+        self.current_regime = 'RANGING'
+        
         # State file
         self.state_file = DATA_DIR / 'risk_state.json'
         self._load_state()
         
         logger.info(f"RiskManager initialized | Equity: ${initial_equity:.2f}")
         logger.info(f"Max drawdown: {MAX_DRAWDOWN_PCT}% | Daily limit: {DAILY_LOSS_LIMIT_PCT}% | Max position: {MAX_POSITION_PCT}%")
+        if FUTURES_MODE:
+            logger.info(f"Futures mode: ON | Leverage: {FUTURES_LEVERAGE}x")
     
     # ================================================================
     # TRADE APPROVAL
@@ -285,29 +291,37 @@ class RiskManager:
         1. Risk-based: risk_amount / distance_to_stop
         2. Allocation-based: strategy_allocation * equity / price
         3. Max position: MAX_POSITION_PCT * equity / price
+        
+        In FUTURES_MODE, sizes are leverage-adjusted (notional = margin * leverage).
         """
         if entry_price <= 0 or self.current_equity <= 0:
             return 0
         
-        # Risk budget
-        risk_amount = self.current_equity * (RISK_PER_TRADE_PCT / 100)
+        # Adaptive risk calculation
+        adaptive_risk_pct = self._calculate_adaptive_risk()
+        risk_amount = self.current_equity * (adaptive_risk_pct / 100)
         
         # Distance to stop
         stop_distance = abs(entry_price - stop_price) if stop_price else entry_price * 0.02
         if stop_distance == 0:
             stop_distance = entry_price * 0.01
         
-        # Risk-based size
+        # Risk-based size (how many units can we buy within our risk budget)
         risk_size = risk_amount / stop_distance
         
         # Allocation-based size
         strategy_budget = self.current_equity * strategy_allocation
+        if FUTURES_MODE:
+            strategy_budget *= FUTURES_LEVERAGE  # Leverage amplifies budget
         already_used = self.strategy_exposure.get(strategy, 0)
         remaining_budget = max(0, strategy_budget - already_used)
         alloc_size = remaining_budget / entry_price
         
         # Max position limit
-        max_size = (self.current_equity * MAX_POSITION_PCT / 100) / entry_price
+        max_position_value = self.current_equity * MAX_POSITION_PCT / 100
+        if FUTURES_MODE:
+            max_position_value *= FUTURES_LEVERAGE
+        max_size = max_position_value / entry_price
         
         # Consecutive loss adjustment (less aggressive reduction)
         if self.consecutive_losses >= 5:
@@ -319,7 +333,68 @@ class RiskManager:
         # Take minimum of all constraints
         position_size = min(risk_size, alloc_size, max_size)
         
+        # Liquidation safety check for futures
+        if FUTURES_MODE and position_size > 0:
+            if not self._check_liquidation_safe(entry_price, stop_price, position_size):
+                logger.warning(f"[RISK] {symbol}: Liquidation too close, reducing size by 50%")
+                position_size *= 0.5
+        
         return max(0, position_size)
+    
+    def _calculate_adaptive_risk(self) -> float:
+        """
+        Dynamically adjust risk per trade based on recent performance and regime.
+        Returns adaptive risk percentage (capped between 2.0% and 6.0%).
+        """
+        base_risk = RISK_PER_TRADE_PCT
+        
+        # Regime multiplier
+        regime_mult = {
+            'TRENDING_BULL': 1.3,
+            'TRENDING_BEAR': 1.3,   # Strong trend = size up (shorting in bear)
+            'HIGH_VOLATILITY': 1.0,
+            'RANGING': 1.0,
+            'CHOPPY': 0.7,
+            'RISK_OFF': 0.3,
+        }.get(self.current_regime, 1.0)
+        
+        # Win streak multiplier based on last 10 trades
+        recent_trades = self.trade_history[-10:] if len(self.trade_history) >= 5 else []
+        streak_mult = 1.0
+        if len(recent_trades) >= 5:
+            recent_wins = sum(1 for t in recent_trades if t.get('pnl', 0) > 0)
+            if recent_wins >= 7:
+                streak_mult = 1.25
+            elif recent_wins <= 3:
+                streak_mult = 0.75
+        
+        adaptive = base_risk * regime_mult * streak_mult
+        adaptive = max(2.0, min(6.0, adaptive))  # Floor 2%, cap 6%
+        
+        if abs(adaptive - base_risk) > 0.5:
+            logger.info(f"[ADAPTIVE] Risk: {base_risk:.1f}% × {regime_mult:.1f} (regime) "
+                       f"× {streak_mult:.2f} (streak) = {adaptive:.1f}%")
+        
+        return adaptive
+    
+    def _check_liquidation_safe(self, entry_price: float, stop_price: float,
+                                 quantity: float) -> bool:
+        """
+        Check if liquidation price is safe distance from entry.
+        Returns True if safe, False if too dangerous.
+        """
+        if not FUTURES_MODE or FUTURES_LEVERAGE <= 1:
+            return True
+        
+        # Estimate ATR from stop distance (stop is typically 2x ATR from entry)
+        atr_estimate = abs(entry_price - stop_price) / 2.0
+        
+        # For LONG: liquidation at entry * (1 - 1/leverage)
+        # For SHORT: liquidation at entry * (1 + 1/leverage)
+        liq_distance = entry_price / FUTURES_LEVERAGE
+        
+        # Must have at least 2x ATR buffer to liquidation
+        return liq_distance > (atr_estimate * 2)
     
     # ================================================================
     # STATISTICS
@@ -394,6 +469,9 @@ class RiskManager:
         today = datetime.now().date()
         if today > self.last_daily_reset:
             logger.info(f"Daily reset | Yesterday P&L: ${self.daily_pnl:.2f}")
+            # Compounding verification log
+            logger.info(f"[COMPOUND] Equity basis: ${self.daily_start_equity:.2f} → ${self.current_equity:.2f} "
+                       f"({((self.current_equity - self.daily_start_equity) / self.daily_start_equity * 100) if self.daily_start_equity > 0 else 0:+.2f}%)")
             self.daily_start_equity = self.current_equity
             self.daily_pnl = 0
             self.last_daily_reset = today

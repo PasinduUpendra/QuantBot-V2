@@ -29,7 +29,8 @@ from core import (
     MR_TIMEFRAME, MR_BB_PERIOD, MR_BB_STD, MR_RSI_PERIOD,
     MR_RSI_OVERSOLD, MR_RSI_OVERBOUGHT, MR_ATR_PERIOD,
     MR_ATR_STOP_MULT, MR_ATR_TARGET_MULT, MR_MAX_POSITIONS,
-    MR_LOOKBACK_CANDLES, MR_MIN_STOP_DISTANCE_PCT
+    MR_LOOKBACK_CANDLES, MR_MIN_STOP_DISTANCE_PCT,
+    FUTURES_MODE
 )
 
 
@@ -44,7 +45,7 @@ class MeanReversionStrategy(BaseStrategy):
         self.pairs = MEAN_REVERSION_PAIRS
         self.open_positions: Dict[str, Dict] = {}
         self.cooldowns: Dict[str, float] = {}  # symbol -> last_trade_time
-        self.cooldown_period = 600  # 10 min cooldown — stop overtrading
+        self.cooldown_period = 300  # Phase 1: 5 min cooldown (was 10min) — MR undertrades at 68.2% WR
         self.choppy_cooldown_period = 1800  # FIX-10: 30 min cooldown in CHOPPY (was 10min — 248 signals in one day)
     
     def analyze(self) -> List[Dict]:
@@ -259,8 +260,8 @@ class MeanReversionStrategy(BaseStrategy):
             if len(self.open_positions) >= MR_MAX_POSITIONS:
                 break
             
-            # Only take BUY signals on spot (can't easily short on spot)
-            if signal['side'] != 'BUY':
+            # Block SHORT signals if Futures mode is not enabled
+            if signal['side'] == 'SELL' and not FUTURES_MODE:
                 continue
             
             try:
@@ -283,14 +284,21 @@ class MeanReversionStrategy(BaseStrategy):
                     continue
                 
                 # Execute trade
-                usdt_amount = position_size * signal['entry']
-                order = self.exchange.market_buy(symbol, usdt_amount)
+                if signal['side'] == 'BUY':
+                    usdt_amount = position_size * signal['entry']
+                    if FUTURES_MODE:
+                        order = self.exchange.futures_market_open(symbol, 'BUY', position_size)
+                    else:
+                        order = self.exchange.market_buy(symbol, usdt_amount)
+                else:
+                    # SELL = open SHORT via Futures
+                    order = self.exchange.futures_market_open(symbol, 'SELL', position_size)
                 
                 if order.get('status') == 'FILLED' or order.get('orderId'):
                     entry_price = signal['entry']
                     
                     self.open_positions[symbol] = {
-                        'side': 'BUY',
+                        'side': signal['side'],
                         'entry_price': entry_price,
                         'quantity': position_size,
                         'stop_loss': signal['stop'],
@@ -301,20 +309,20 @@ class MeanReversionStrategy(BaseStrategy):
                     }
                     
                     self.risk.register_position(
-                        symbol, 'BUY', position_size, entry_price, 'MEAN_REV',
+                        symbol, signal['side'], position_size, entry_price, 'MEAN_REV',
                         signal['stop'], signal['target']
                     )
                     
                     self.cooldowns[symbol] = time.time()
                     
-                    logger.info(f"[MR] ENTERED: BUY {position_size:.6f} {symbol} @ {entry_price:.2f} | "
+                    logger.info(f"[MR] ENTERED: {signal['side']} {position_size:.6f} {symbol} @ {entry_price:.2f} | "
                               f"Stop: {signal['stop']:.2f} | Target: {signal['target']:.2f}")
                     
             except Exception as e:
                 logger.error(f"[MR] Error executing trade for {symbol}: {e}")
     
     def manage_positions(self):
-        """Monitor and manage open mean reversion positions."""
+        """Monitor and manage open mean reversion positions (LONG and SHORT)."""
         for symbol in list(self.open_positions.keys()):
             try:
                 pos = self.open_positions[symbol]
@@ -328,42 +336,107 @@ class MeanReversionStrategy(BaseStrategy):
                 
                 should_exit = False
                 exit_reason = ""
+                is_short = pos['side'] == 'SELL'
                 
-                # Check stop loss
-                if current_price <= pos['stop_loss']:
-                    should_exit = True
-                    exit_reason = "Stop loss hit"
-                
-                # Check take profit
-                elif current_price >= pos['take_profit']:
-                    should_exit = True
-                    exit_reason = "Take profit hit"
-                
-                # Time-based exit: close after 1 hour if minimal movement
-                elif time.time() - pos['entry_time'] > 3600:  # 1 hour (was 2h)
-                    pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
-                    if abs(pnl_pct) < 0.05:
+                if is_short:
+                    # ===== SHORT POSITION MANAGEMENT =====
+                    # Check stop loss (price rising = bad for short)
+                    if current_price >= pos['stop_loss']:
                         should_exit = True
-                        exit_reason = "Time exit (stale)"
-                
-                # Adaptive trailing stop after 50% of target reached
-                target_distance = pos['take_profit'] - pos['entry_price']
-                current_distance = current_price - pos['entry_price']
-                if target_distance > 0 and current_distance > target_distance * 0.5:
-                    # Move stop to breakeven + small buffer
-                    new_stop = pos['entry_price'] + (target_distance * 0.25)
-                    if new_stop > pos['stop_loss']:
-                        pos['stop_loss'] = new_stop
-                        self.risk.positions.get(symbol, {})['stop_loss'] = new_stop
-                
-                if should_exit:
-                    # Execute exit
-                    order = self.exchange.market_sell(symbol, pos['quantity'])
+                        exit_reason = "Stop loss hit"
                     
-                    if order.get('status') == 'FILLED' or order.get('orderId'):
-                        self.risk.close_position(symbol, current_price, exit_reason)
-                        del self.open_positions[symbol]
-                        logger.info(f"[MR] EXITED: {symbol} @ {current_price:.2f} | {exit_reason}")
+                    # Check take profit (price below target = good for short)
+                    elif current_price <= pos['take_profit']:
+                        should_exit = True
+                        exit_reason = "Take profit hit"
+                    
+                    # Time exit at 45min
+                    elif time.time() - pos['entry_time'] > 2700:
+                        pnl_pct = (pos['entry_price'] - current_price) / pos['entry_price'] * 100
+                        if abs(pnl_pct) < 0.05:
+                            should_exit = True
+                            exit_reason = "Time exit (stale)"
+                    
+                    # Profit ratchet for SHORT positions
+                    target_distance = pos['entry_price'] - pos['take_profit']  # Positive for shorts
+                    current_distance = pos['entry_price'] - current_price       # Positive when in profit
+                    
+                    if target_distance > 0 and current_distance > 0:
+                        new_stop = None
+                        if current_distance >= target_distance * 0.8:
+                            new_stop = pos['entry_price'] - (target_distance * 0.6)
+                        elif current_distance >= target_distance * 0.6:
+                            new_stop = pos['entry_price'] - (target_distance * 0.4)
+                        elif current_distance >= target_distance * 0.4:
+                            new_stop = pos['entry_price'] - (target_distance * 0.1)
+                        
+                        # For shorts, ratchet moves stop DOWN (closer to current price)
+                        if new_stop and new_stop < pos['stop_loss']:
+                            pos['stop_loss'] = new_stop
+                            if symbol in self.risk.positions:
+                                self.risk.positions[symbol]['stop_loss'] = new_stop
+                            logger.info(f"[MR] Stop ratcheted to {new_stop:.2f} for SHORT {symbol}")
+                    
+                    if should_exit:
+                        # Close SHORT = BUY to close
+                        if FUTURES_MODE:
+                            order = self.exchange.futures_market_close(symbol, 'BUY', pos['quantity'])
+                        else:
+                            order = self.exchange.market_buy(symbol, pos['quantity'] * current_price)
+                        
+                        if order.get('status') == 'FILLED' or order.get('orderId'):
+                            self.risk.close_position(symbol, current_price, exit_reason)
+                            del self.open_positions[symbol]
+                            logger.info(f"[MR] EXITED SHORT: {symbol} @ {current_price:.2f} | {exit_reason}")
+                
+                else:
+                    # ===== LONG POSITION MANAGEMENT (existing logic) =====
+                    # Check stop loss
+                    if current_price <= pos['stop_loss']:
+                        should_exit = True
+                        exit_reason = "Stop loss hit"
+                    
+                    # Check take profit
+                    elif current_price >= pos['take_profit']:
+                        should_exit = True
+                        exit_reason = "Take profit hit"
+                    
+                    # Time-based exit at 45min
+                    elif time.time() - pos['entry_time'] > 2700:
+                        pnl_pct = (current_price - pos['entry_price']) / pos['entry_price'] * 100
+                        if abs(pnl_pct) < 0.05:
+                            should_exit = True
+                            exit_reason = "Time exit (stale)"
+                    
+                    # Profit ratchet for LONG
+                    target_distance = pos['take_profit'] - pos['entry_price']
+                    current_distance = current_price - pos['entry_price']
+                    
+                    if target_distance > 0:
+                        new_stop = None
+                        if current_distance >= target_distance * 0.8:
+                            new_stop = pos['entry_price'] + (target_distance * 0.6)
+                        elif current_distance >= target_distance * 0.6:
+                            new_stop = pos['entry_price'] + (target_distance * 0.4)
+                        elif current_distance >= target_distance * 0.4:
+                            new_stop = pos['entry_price'] + (target_distance * 0.1)
+                            
+                        if new_stop and new_stop > pos['stop_loss']:
+                            pos['stop_loss'] = new_stop
+                            if symbol in self.risk.positions:
+                                self.risk.positions[symbol]['stop_loss'] = new_stop
+                            logger.info(f"[MR] Stop loss ratcheted to {new_stop:.2f} for {symbol} to lock profit")
+                    
+                    if should_exit:
+                        if FUTURES_MODE:
+                            order = self.exchange.futures_market_close(symbol, 'SELL', pos['quantity'])
+                        else:
+                            order = self.exchange.market_sell(symbol, pos['quantity'])
+                        
+                        if order.get('status') == 'FILLED' or order.get('orderId'):
+                            self.risk.close_position(symbol, current_price, exit_reason)
+                            del self.open_positions[symbol]
+                            logger.info(f"[MR] EXITED: {symbol} @ {current_price:.2f} | {exit_reason}")
                         
             except Exception as e:
                 logger.error(f"[MR] Error managing {symbol}: {e}")

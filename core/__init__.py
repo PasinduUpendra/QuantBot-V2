@@ -85,6 +85,12 @@ MOM_MAX_POSITIONS = 2               # FIX-7: Reduced from 3 — max 4 directiona
 MOM_LOOKBACK_CANDLES = 100          # Candles to fetch
 
 # ============================================================
+# FUTURES CONFIGURATION
+# ============================================================
+FUTURES_MODE = os.getenv('FUTURES_MODE', 'false').lower() == 'true'
+FUTURES_LEVERAGE = int(os.getenv('FUTURES_LEVERAGE', 3))
+
+# ============================================================
 # FUNDING RATE ARBITRAGE PARAMETERS (DISABLED - no futures perms)
 # ============================================================
 FUND_MIN_RATE = 0.01                # Min funding rate (%) to enter
