@@ -112,12 +112,12 @@ class RiskManager:
             logger.warning(f"CIRCUIT BREAKER: {self.halt_reason}")
             return False, self.halt_reason
         
-        # Rule 3: Single position size limit (leverage-adjusted)
-        existing_position_value = 0
+        # Rule 3: Reject duplicate symbol (paper trading tracks one position per symbol)
         if symbol in self.positions:
-            existing_position_value = self.positions[symbol].get('value', 0)
+            return False, f"Already have open position in {symbol}"
         
-        new_position_value = existing_position_value + trade_value
+        # Rule 3b: Single position size limit (leverage-adjusted)
+        new_position_value = trade_value
         position_pct = (new_position_value / self.current_equity) * 100 if self.current_equity > 0 else 100
         
         if position_pct > MAX_POSITION_PCT * leverage_factor:

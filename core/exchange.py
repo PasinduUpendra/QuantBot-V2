@@ -774,6 +774,17 @@ class BinanceConnector:
                     del self._paper_futures_positions[symbol]
                 order['status'] = 'FILLED'
             elif side == 'SELL':
+                # Safety: close existing position first to prevent margin loss
+                if symbol in self._paper_futures_positions:
+                    old_pos = self._paper_futures_positions[symbol]
+                    if old_pos['side'] == 'SHORT':
+                        old_pnl = (old_pos['entry_price'] - exec_price) * old_pos['quantity']
+                    else:
+                        old_pnl = (exec_price - old_pos['entry_price']) * old_pos['quantity']
+                    old_fee = old_pos['quantity'] * exec_price * 0.0004
+                    self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) + old_pos['margin'] + old_pnl - old_fee
+                    logger.warning(f"[PAPER FUTURES] AUTO-CLOSE {old_pos['side']} {symbol} before new SELL | PnL: ${old_pnl:+.2f}")
+                    del self._paper_futures_positions[symbol]
                 # Opening a SHORT position
                 self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) - margin - fee
                 liq_price = exec_price * (1 + 1.0 / leverage)  # Simplified liquidation
@@ -790,6 +801,17 @@ class BinanceConnector:
                 logger.info(f"[PAPER FUTURES] SHORT {quantity:.6f} {symbol} @ {exec_price:.2f} "
                            f"| Margin: ${margin:.2f} | Lev: {leverage}x | Liq: {liq_price:.2f}")
             elif side == 'BUY':
+                # Safety: close existing position first to prevent margin loss
+                if symbol in self._paper_futures_positions:
+                    old_pos = self._paper_futures_positions[symbol]
+                    if old_pos['side'] == 'SHORT':
+                        old_pnl = (old_pos['entry_price'] - exec_price) * old_pos['quantity']
+                    else:
+                        old_pnl = (exec_price - old_pos['entry_price']) * old_pos['quantity']
+                    old_fee = old_pos['quantity'] * exec_price * 0.0004
+                    self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) + old_pos['margin'] + old_pnl - old_fee
+                    logger.warning(f"[PAPER FUTURES] AUTO-CLOSE {old_pos['side']} {symbol} before new BUY | PnL: ${old_pnl:+.2f}")
+                    del self._paper_futures_positions[symbol]
                 # Opening a LONG position (futures)
                 self._paper_balance['USDT'] = self._paper_balance.get('USDT', 0) - margin - fee
                 liq_price = exec_price * (1 - 1.0 / leverage)  # Simplified liquidation
