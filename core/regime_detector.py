@@ -49,7 +49,7 @@ class MarketRegimeDetector:
             'GRID': 0.00, 'MEAN_REV': 0.40, 'MOMENTUM': 0.60, 'FUND_ARB': 0.00
         },
         'CHOPPY': {
-            'GRID': 0.00, 'MEAN_REV': 1.00, 'MOMENTUM': 0.00, 'FUND_ARB': 0.00
+            'GRID': 0.00, 'MEAN_REV': 0.65, 'MOMENTUM': 0.35, 'FUND_ARB': 0.00
         },
         'RISK_OFF': {
             'GRID': 0.00, 'MEAN_REV': 0.30, 'MOMENTUM': 0.70, 'FUND_ARB': 0.00

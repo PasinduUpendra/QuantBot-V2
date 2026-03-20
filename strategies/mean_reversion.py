@@ -117,23 +117,38 @@ class MeanReversionStrategy(BaseStrategy):
                     if sma_slope < -0.1:  # FIX-5: Tightened from -0.3 — any SMA decline = no entry
                         continue
                 
-                # FIX-10: Tighter entry thresholds in CHOPPY
+                # FIX-10: Adaptive entry thresholds per regime
                 choppy_mode = self.current_regime == 'CHOPPY'
-                entry_pct_b = 0.03 if choppy_mode else 0.10     # Truly at the extreme in chop
-                entry_rsi = 25 if choppy_mode else MR_RSI_OVERSOLD  # Truly oversold in chop
-                entry_vol = 1.3 if choppy_mode else 1.0         # Need stronger volume in chop
+                if choppy_mode:
+                    # CHOPPY reality: everything mid-range, low volume
+                    # Volume filter removed — low vol IS the definition of CHOPPY
+                    # Position size already reduced by adaptive risk (0.7x regime mult)
+                    entry_pct_b = 0.25    # Bottom quarter of bands
+                    entry_rsi = 42        # Mildly oversold (CHOPPY RSI range: 42-58)
+                    entry_vol = 0         # No volume gate — chop = low vol by definition
+                    short_pct_b = 0.75    # Top quarter for SHORT
+                    short_rsi = 58        # Mildly overbought
+                    short_vol = 0         # No volume gate
+                else:
+                    entry_pct_b = 0.10
+                    entry_rsi = MR_RSI_OVERSOLD
+                    entry_vol = 1.0
+                    short_pct_b = 0.85
+                    short_rsi = MR_RSI_OVERBOUGHT
+                    short_vol = 1.0
                 
                 # LONG SIGNAL: Price near/below lower band + RSI oversold + volume spike
+                sma_slope_limit = -0.15 if choppy_mode else -0.1
                 if (current_pct_b < entry_pct_b and 
                     current_rsi < entry_rsi and
                     vol_ratio > entry_vol and
-                    sma_slope > -0.1):  # FIX-5: Tightened from -0.5 — SMA must be flat or rising
+                    sma_slope > sma_slope_limit):
                     
-                    # Confluence score
+                    # Confluence score (use entry thresholds as reference for strength calc)
                     strength = 0
-                    strength += min(1.0, (MR_RSI_OVERSOLD - current_rsi) / 20)  # RSI extremity
-                    strength += min(1.0, max(0, (0.1 - current_pct_b) / 0.1))   # BB extremity
-                    strength += min(0.5, (vol_ratio - 1) * 0.5)                   # Volume
+                    strength += min(1.0, max(0, (entry_rsi - current_rsi) / 20))   # RSI extremity
+                    strength += min(1.0, max(0, (entry_pct_b - current_pct_b) / entry_pct_b))  # BB extremity
+                    strength += min(0.5, max(0, (vol_ratio - 1) * 0.5))            # Volume (clamped >=0)
                     
                     # Check for bullish candle pattern (hammer, engulfing)
                     if self._is_bullish_reversal(df):
@@ -166,14 +181,14 @@ class MeanReversionStrategy(BaseStrategy):
                     }
                 
                 # SHORT SIGNAL: Price near/above upper band + RSI overbought + volume spike
-                elif (current_pct_b > 0.85 and 
-                      current_rsi > MR_RSI_OVERBOUGHT and
-                      vol_ratio > 1.0):
+                elif (current_pct_b > short_pct_b and 
+                      current_rsi > short_rsi and
+                      vol_ratio > short_vol):
                     
                     strength = 0
-                    strength += min(1.0, (current_rsi - MR_RSI_OVERBOUGHT) / 20)
-                    strength += min(1.0, max(0, (current_pct_b - 0.9) / 0.1))
-                    strength += min(0.5, (vol_ratio - 1) * 0.5)
+                    strength += min(1.0, max(0, (current_rsi - short_rsi) / 20))   # RSI extremity
+                    strength += min(1.0, max(0, (current_pct_b - 0.9) / 0.1))      # BB extremity
+                    strength += min(0.5, max(0, (vol_ratio - 1) * 0.5))             # Volume
                     
                     if self._is_bearish_reversal(df):
                         strength += 0.5
@@ -201,14 +216,12 @@ class MeanReversionStrategy(BaseStrategy):
                         'bb_width': current_bb_width,
                     }
                 
-                # FIX-10: In CHOPPY, require much stronger confluence
-                # Mar 3: 248 MR signals, most were marginal and lost money
-                min_strength = 1.5
-                if self.current_regime == 'CHOPPY':
-                    min_strength = 2.0  # Only take very strong signals in chop
+                # FIX-10: Minimum strength gate — entry conditions ARE the filter in CHOPPY
+                # In CHOPPY, signals inherently weak — rely on R:R for quality
+                min_strength = 0.0 if choppy_mode else 1.5
                 
-                # FIX-11: Minimum R:R check — don't enter if target is too close
-                # Mar 3: many wins were +$0.12-$0.57 while losses were -$1.42-$3.64
+                # FIX-11: Minimum R:R check — lower bar in CHOPPY (smaller moves)
+                min_rr = 1.0 if choppy_mode else 1.5
                 if signal:
                     if signal['side'] == 'BUY':
                         reward = signal['target'] - signal['entry']
@@ -217,17 +230,28 @@ class MeanReversionStrategy(BaseStrategy):
                         reward = signal['entry'] - signal['target']
                         risk = signal['stop'] - signal['entry']
                     
-                    if risk > 0 and reward / risk < 1.5:
-                        signal = None  # R:R too poor, skip
+                    rr = reward / risk if risk > 0 else 0
+                    if rr < min_rr:
+                        logger.debug(f"[MR] {symbol}: R:R {rr:.2f} < {min_rr} — skipped")
+                        signal = None
                 
                 if signal and signal['strength'] >= min_strength:
                     signals.append(signal)
                     logger.info(f"[MR] Signal: {signal['side']} {symbol} | "
                               f"Strength: {signal['strength']:.2f} | "
                               f"RSI: {signal['rsi']:.1f} | %B: {signal['pct_b']:.2f}")
+                else:
+                    # Near-miss diagnostic: log closest symbol each cycle
+                    if not signal:
+                        logger.debug(f"[MR] {symbol}: no signal (RSI={current_rsi:.0f} %B={current_pct_b:.2f} vol={vol_ratio:.1f})")
+                    elif signal['strength'] < min_strength:
+                        logger.debug(f"[MR] {symbol}: weak signal str={signal['strength']:.2f}<{min_strength}")
                     
             except Exception as e:
                 logger.error(f"[MR] Error analyzing {symbol}: {e}")
+        
+        if not signals and self.allocation > 0:
+            logger.info(f"[MR] Scan complete: 0 signals from {len(self.pairs)} pairs (regime={self.current_regime})")
         
         self._signals = signals
         return signals

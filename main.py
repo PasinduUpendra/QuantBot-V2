@@ -77,6 +77,7 @@ class HydraEngine:
         'REGIME': 1200,    # Regime check every 20 min (was 30)
         'STATS': 120,      # Stats every 2 min
         'SAVE': 300,       # Save state every 5 min
+        'HEALTH': 1800,    # Self-diagnostic watchdog every 30 min
     }
     
     def __init__(self):
@@ -134,6 +135,18 @@ class HydraEngine:
         
         # Performance log
         self.perf_log_file = DATA_DIR / 'performance.jsonl'
+        
+        # Watchdog: signal & execution tracking
+        self._watchdog = {
+            'signals_generated': 0,
+            'trades_executed': 0,
+            'rejections': 0,
+            'zero_size': 0,
+            'last_trade_time': 0,
+            'last_signal_time': 0,
+            'signals_by_strategy': {'MOMENTUM': 0, 'MEAN_REV': 0},
+            'audit_count': 0,
+        }
         
         logger.info("HYDRA Engine initialized successfully")
     
@@ -261,6 +274,11 @@ class HydraEngine:
                     self._save_state()
                     self.last_run['SAVE'] = now
                 
+                # ===== 6. SELF-DIAGNOSTIC WATCHDOG =====
+                if now - self.last_run.get('HEALTH', 0) > self.INTERVALS['HEALTH']:
+                    self._run_health_audit()
+                    self.last_run['HEALTH'] = now
+                
                 # Sleep between cycles (faster for aggressive mode)
                 cycle_time = time.time() - cycle_start
                 sleep_time = max(0.5, 3 - cycle_time)  # Target 3-second cycles (was 5)
@@ -295,6 +313,78 @@ class HydraEngine:
         except Exception as e:
             logger.error(f"Strategy [{name}] error: {e}")
             logger.debug(traceback.format_exc())
+    
+    def _run_health_audit(self):
+        """Self-diagnostic watchdog — detects silent failures that prevent trading."""
+        self._watchdog['audit_count'] += 1
+        uptime_h = (time.time() - self.start_time) / 3600
+        total_trades = self.risk.total_trades
+        
+        # Count current signals & rejections from strategy internals
+        mom_signals = len(getattr(self.strategies.get('MOMENTUM'), '_signals', []) or [])
+        mr_signals = len(getattr(self.strategies.get('MEAN_REV'), '_signals', []) or [])
+        self._watchdog['signals_generated'] += mom_signals + mr_signals
+        
+        problems = []
+        
+        # CHECK 1: Zero trades after significant uptime
+        if uptime_h >= 1.0 and total_trades == 0:
+            problems.append(f"ZERO TRADES in {uptime_h:.1f}h — bot is not trading!")
+            
+            # Diagnose WHY
+            for name in ['MOMENTUM', 'MEAN_REV']:
+                strat = self.strategies.get(name)
+                if not strat:
+                    continue
+                alloc = strat.allocation
+                regime = strat.current_regime
+                
+                if alloc <= 0:
+                    problems.append(f"  {name}: allocation=0% (regime={regime}) → will never trade")
+                elif alloc < 0.2:
+                    problems.append(f"  {name}: allocation={alloc*100:.0f}% (regime={regime}) → very low budget")
+                else:
+                    # Has allocation but no trades — check signal pipeline
+                    signals = getattr(strat, '_signals', []) or []
+                    if not signals:
+                        problems.append(f"  {name}: alloc={alloc*100:.0f}% but 0 signals → thresholds too tight?")
+                    else:
+                        problems.append(f"  {name}: alloc={alloc*100:.0f}%, {len(signals)} signals → execution blocked")
+        
+        # CHECK 2: Signals generated but conversion rate is 0%
+        if self._watchdog['signals_generated'] > 10 and total_trades == 0:
+            problems.append(f"SIGNAL LEAK: {self._watchdog['signals_generated']} signals generated, 0 executed")
+        
+        # CHECK 3: Risk manager halted
+        if self.risk.trading_halted:
+            problems.append(f"TRADING HALTED: {self.risk.halt_reason}")
+        
+        # CHECK 4: All strategies disabled or zero allocation
+        active_alloc = sum(s.allocation for name, s in self.strategies.items() 
+                          if s.active and name not in ('GRID', 'FUND_ARB'))
+        if active_alloc <= 0:
+            problems.append(f"ALL ACTIVE STRATEGIES HAVE 0% ALLOCATION (regime={self.regime_detector.current_regime})")
+        
+        # CHECK 5: No trade in extended period (after first trade)
+        if total_trades > 0:
+            last_trade_age = time.time() - max((t.get('timestamp', 0) for t in self.risk.trade_history), default=0)
+            if last_trade_age > 7200:  # 2 hours since last trade
+                problems.append(f"STALE: Last trade was {last_trade_age/3600:.1f}h ago")
+        
+        # REPORT
+        if problems:
+            logger.warning("="*60)
+            logger.warning("[WATCHDOG] HEALTH AUDIT — PROBLEMS DETECTED")
+            logger.warning("="*60)
+            for p in problems:
+                logger.warning(f"[WATCHDOG] {p}")
+            logger.warning(f"[WATCHDOG] Uptime: {uptime_h:.1f}h | Trades: {total_trades} | "
+                          f"Regime: {self.regime_detector.current_regime} | "
+                          f"Signals seen: {self._watchdog['signals_generated']}")
+            logger.warning("="*60)
+        else:
+            logger.info(f"[WATCHDOG] Health OK | {uptime_h:.1f}h | {total_trades} trades | "
+                       f"Regime: {self.regime_detector.current_regime}")
     
     def _run_regime_detection(self):
         """Run market regime detection and adjust allocations."""

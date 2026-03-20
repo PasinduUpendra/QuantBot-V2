@@ -182,6 +182,7 @@ class BinanceConnector:
                         total += qty * price
             # Add unrealized PnL from paper futures positions
             for symbol, pos in self._paper_futures_positions.items():
+                total += pos.get('margin', 0)  # Add back locked margin
                 price = self.get_price(symbol)
                 if price:
                     if pos['side'] == 'SHORT':
