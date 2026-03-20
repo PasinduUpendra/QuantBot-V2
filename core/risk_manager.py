@@ -92,6 +92,10 @@ class RiskManager:
         
         trade_value = quantity * price
         
+        # In futures mode, position sizing uses leverage-amplified budgets (notional),
+        # so approval limits must also be leverage-adjusted to match
+        leverage_factor = FUTURES_LEVERAGE if FUTURES_MODE else 1
+        
         # Rule 1: Daily loss limit
         daily_loss_pct = (self.daily_pnl / self.daily_start_equity) * 100 if self.daily_start_equity > 0 else 0
         if daily_loss_pct < -DAILY_LOSS_LIMIT_PCT:
@@ -108,7 +112,7 @@ class RiskManager:
             logger.warning(f"CIRCUIT BREAKER: {self.halt_reason}")
             return False, self.halt_reason
         
-        # Rule 3: Single position size limit
+        # Rule 3: Single position size limit (leverage-adjusted)
         existing_position_value = 0
         if symbol in self.positions:
             existing_position_value = self.positions[symbol].get('value', 0)
@@ -116,16 +120,16 @@ class RiskManager:
         new_position_value = existing_position_value + trade_value
         position_pct = (new_position_value / self.current_equity) * 100 if self.current_equity > 0 else 100
         
-        if position_pct > MAX_POSITION_PCT:
-            return False, f"Position size {position_pct:.1f}% exceeds limit {MAX_POSITION_PCT}%"
+        if position_pct > MAX_POSITION_PCT * leverage_factor:
+            return False, f"Position size {position_pct:.1f}% exceeds limit {MAX_POSITION_PCT * leverage_factor}%"
         
-        # Rule 4: Total exposure limit
+        # Rule 4: Total exposure limit (leverage-adjusted)
         total_exposure = sum(p.get('value', 0) for p in self.positions.values())
         new_total = total_exposure + trade_value
         exposure_pct = (new_total / self.current_equity) * 100 if self.current_equity > 0 else 100
         
-        if exposure_pct > MAX_TOTAL_EXPOSURE_PCT:
-            return False, f"Total exposure {exposure_pct:.1f}% exceeds limit {MAX_TOTAL_EXPOSURE_PCT}%"
+        if exposure_pct > MAX_TOTAL_EXPOSURE_PCT * leverage_factor:
+            return False, f"Total exposure {exposure_pct:.1f}% exceeds limit {MAX_TOTAL_EXPOSURE_PCT * leverage_factor}%"
         
         # Rule 5: Per-trade risk limit
         risk_amount = trade_value * (RISK_PER_TRADE_PCT / 100)
@@ -133,14 +137,14 @@ class RiskManager:
         
         # Rule 6: Consecutive loss throttle (only after 7 losses, less aggressive)
         if self.consecutive_losses >= 7:
-            if trade_value > (self.current_equity * MAX_POSITION_PCT / 200):
+            if trade_value > (self.current_equity * MAX_POSITION_PCT * leverage_factor / 200):
                 return False, f"Consecutive losses ({self.consecutive_losses}): reduce size"
         
         # Rule 7: Minimum trade value (configurable - lower in paper mode)
         if trade_value < MIN_TRADE_VALUE:
             return False, f"Trade value ${trade_value:.2f} below minimum ${MIN_TRADE_VALUE:.0f}"
         
-        logger.debug(f"Trade approved: {side} {quantity:.6f} {symbol} @ {price:.2f} (${trade_value:.2f}) [{strategy}]")
+        logger.info(f"[RISK] APPROVED: {side} {quantity:.6f} {symbol} @ {price:.2f} (${trade_value:.2f}) [{strategy}]")
         return True, "Approved"
     
     # ================================================================

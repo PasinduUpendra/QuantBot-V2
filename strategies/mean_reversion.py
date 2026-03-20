@@ -272,6 +272,7 @@ class MeanReversionStrategy(BaseStrategy):
                 )
                 
                 if position_size <= 0:
+                    logger.warning(f"[MR] {symbol}: position_size=0 (alloc={self.allocation:.2f})")
                     continue
                 
                 # Check with risk manager
@@ -280,7 +281,7 @@ class MeanReversionStrategy(BaseStrategy):
                 )
                 
                 if not approved:
-                    logger.debug(f"[MR] Trade rejected for {symbol}: {reason}")
+                    logger.warning(f"[MR] REJECTED {symbol}: {reason}")
                     continue
                 
                 # Execute trade

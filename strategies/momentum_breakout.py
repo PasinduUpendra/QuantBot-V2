@@ -268,6 +268,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 )
                 
                 if position_size <= 0:
+                    logger.warning(f"[MOM] {symbol}: position_size=0 (alloc={self.allocation:.2f})")
                     continue
                 
                 approved, reason = self.risk.approve_trade(
@@ -275,7 +276,7 @@ class MomentumBreakoutStrategy(BaseStrategy):
                 )
                 
                 if not approved:
-                    logger.debug(f"[MOM] Rejected {symbol}: {reason}")
+                    logger.warning(f"[MOM] REJECTED {symbol}: {reason}")
                     continue
                 
                 # Execute based on side
